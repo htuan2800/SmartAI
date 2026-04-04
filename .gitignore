@@ -1,0 +1,16 @@
+# 1. Bỏ qua Môi trường ảo
+venv/
+env/
+
+# 2. Bỏ qua Dữ liệu và Cache của hệ thống RAG
+data/
+*.pdf
+
+# 3. Bỏ qua các file rác do Python tự sinh ra
+__pycache__/
+*.pyc
+*.pyo
+
+# 4. Bỏ qua file cấu hình của hệ điều hành (nếu dùng Mac/Windows)
+.DS_Store
+Thumbs.db

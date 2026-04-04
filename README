@@ -1,0 +1,102 @@
+---
+
+### ✅ Bản README đã tối ưu cú pháp (Bạn có thể Copy ngay)
+
+```markdown
+# 📚 SmartDoc AI - Intelligent Document Q&A System
+
+Hệ thống RAG (Retrieval-Augmented Generation) hoạt động hoàn toàn offline, cho phép người dùng hỏi đáp trực tiếp trên các tài liệu PDF bằng ngôn ngữ tự nhiên. Dự án được tối ưu hóa với cơ chế Caching FAISS, Fallback Loader và thuật toán tìm kiếm MMR.
+
+---
+
+## 🛠️ 1. Công nghệ sử dụng
+
+Hệ thống được xây dựng dựa trên các công nghệ và thư viện sau:
+
+### Frontend
+* **Streamlit (1.41.1):** Framework chính để xây dựng Web App.
+* **HTML/CSS:** Custom styling (tinh chỉnh màu sắc, giao diện).
+
+### Backend & AI
+* **LangChain (0.3.16):** Framework cốt lõi cho ứng dụng LLM.
+* **LangChain Community (0.3.16):** Các tiện ích mở rộng của cộng đồng.
+* **FAISS (1.9.0):** Cơ sở dữ liệu Vector dùng để tìm kiếm sự tương đồng.
+* **HuggingFace Transformers:** Mô hình embedding `Multilingual MPNet` (768-dim).
+* **Ollama:** Môi trường chạy LLM nội bộ (Local LLM runtime).
+
+---
+
+## ⚙️ 2. Yêu cầu hệ thống (System Requirements)
+
+Để chạy được dự án, máy tính của bạn cần cài đặt sẵn:
+* **Python 3.8+**
+* **Ollama runtime**
+* **pip** (Python package manager)
+
+---
+
+## 🚀 3. Các bước cài đặt (Installation)
+
+Thực hiện lần lượt các bước sau trên Terminal / Command Prompt:
+
+**Bước 1: Clone dự án**
+```bash
+git clone [repository-url]
+cd Project-LLMs-Rag-Agent
+```
+
+**Bước 2: Tạo môi trường ảo**
+```bash
+python -m venv venv
+# Linux/Mac
+source venv/bin/activate  
+# Windows
+venv\Scripts\activate     
+```
+
+**Bước 3: Cài đặt thư viện**
+```bash
+pip install -r requirements.txt
+```
+
+**Bước 4: Cài đặt mô hình AI (Ollama)**
+```bash
+# Tải Ollama tại https://ollama.ai
+ollama pull qwen2.5:7b
+```
+
+**Bước 5: Chạy ứng dụng**
+```bash
+streamlit run app.py
+```
+
+---
+
+## 💡 4. Hướng dẫn sử dụng
+
+### Upload tài liệu:
+1. Click vào **"Browse files"** hoặc kéo thả file PDF.
+2. Chờ thông báo **"PDF uploaded successfully!"**.
+3. Xem tiến trình tại các mục: "Splitting..." và "Creating embeddings...".
+
+### Đặt câu hỏi:
+1. Nhập câu hỏi vào ô **"Ask a Question"**.
+2. Nhấn **Enter** và chờ hệ thống xử lý.
+3. Xem câu trả lời hiển thị dưới phần **"Response"**.
+
+> **Tips:** Đặt câu hỏi cụ thể, sử dụng từ khóa có trong tài liệu để có kết quả chính xác nhất.
+
+---
+
+## 📂 5. Cấu trúc thư mục
+
+```plaintext
+Project-LLMs-Rag-Agent/
+├── app.py                  # File chạy chính
+├── config.py               # Cấu hình tham số
+├── document_processor.py   # Xử lý PDF & cắt văn bản
+├── rag_engine.py           # Embeddings, Vector Store & LLM
+├── requirements.txt        # Danh sách thư viện
+├── data/                   # Thư mục dữ liệu (Tự động sinh)
+│   ├── faiss_cache/        # Bộ nhớ đệm Vector Store
+│   └── uploads/            # Lưu trữ PDF tạm thời

@@ -1,0 +1,25 @@
+# Giao diện Web
+streamlit>=1.41
+
+# Framework cốt lõi (LangChain & RAG)
+langchain>=0.3.16
+langchain-community>=0.3.16
+langchain-text-splitters
+langchain-ollama
+
+# Vector Database (FAISS)
+faiss-cpu==1.9.0
+
+# Các mô hình Embedding
+sentence-transformers
+transformers
+torch
+
+# Xử lý file PDF (Chính & Dự phòng)
+pdfplumber
+pypdf
+
+# Tiện ích bổ sung
+langdetect>=1.0.9
+numpy
+pandas
