@@ -18,6 +18,7 @@ def get_embedding():
         encode_kwargs={'normalize_embeddings': True}
     )
 
+#Khởi tạo cầu nối giao tiếp với phần mềm Ollama (nơi đang chạy mô hình Qwen2.5:7b).
 def get_llm():
     try:
         from langchain_ollama import OllamaLLM
@@ -31,7 +32,7 @@ def get_vector_store(chunks, file_bytes: bytes):
     persist_dir = config.FAISS_DIR / doc_hash
     embedder = get_embedding()
 
-    # Nếu đã có cache trên ổ cứng, Load lên ngay lập tức (0.1 giây)
+    # Nếu đã có cache trên ổ cứng, Load lên ngay lập tức
     if persist_dir.exists() and any(persist_dir.iterdir()):
         return FAISS.load_local(str(persist_dir), embedder, allow_dangerous_deserialization=True)
     
@@ -52,14 +53,16 @@ def detect_language(text: str) -> str:
 def ask_question(query: str, retriever, llm):
     """Tạo Prompt và giới hạn Context an toàn."""
     lang = detect_language(query)
+    #Thực thi tìm kiếm : FAISS tìm top-k chunks liên quan nhất
     docs = retriever.invoke(query)
-    #Phần nâng cao 7.2.5
+    #Phần 7.2.5
     logger.info(f"Retrieved {len(docs)} documents")
     # Gom văn bản và ngắt ở mức 12000 ký tự để tránh lỗi 500 của Ollama
     context = "\n\n".join([d.page_content for d in docs])
     if len(context) > 12000:
         context = context[:12000]
 
+    #Tạo prompt
     if lang == "vi":
         prompt = f"""Sử dụng ngữ cảnh sau đây để trả lời câu hỏi.
 Nếu bạn không biết, chỉ cần nói là bạn không biết.
@@ -75,5 +78,5 @@ If you don't know the answer, just say you don't know. Keep answer concise (3-4 
 Context: {context}
 Question: {query}
 Answer:"""
-    
+    #Sinh câu trả lời
     return llm.invoke(prompt)

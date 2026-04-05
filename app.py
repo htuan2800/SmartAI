@@ -4,7 +4,7 @@ import config
 from document_processor import load_and_split_pdf
 from rag_engine import get_vector_store, ask_question, get_llm
 import hashlib
-import logging # THÊM DÒNG NÀY
+import logging
 
 # Phần nâng cao 7.2.5: Cấu hình logging để theo dõi quá trình truy xuất và xử lý
 logging.basicConfig(level=logging.INFO)
@@ -46,7 +46,7 @@ with st.sidebar:
 
 
 # 3. MAIN AREA (Chính giữa)
-st.title("📚 Intelligent Document Q&A System")
+st.title("Intelligent Document Q&A System")
 st.caption("RAG System với LLMs - Tối ưu hóa: Caching, Fallback, LangDetect")
 
 # Khởi tạo bộ nhớ tạm (Session State)
@@ -54,7 +54,7 @@ if "doc_hash" not in st.session_state:
     st.session_state.doc_hash = None
     st.session_state.retriever = None
 
-# FEATURE 1: File Upload (Mục 5.3.1)
+# FEATURE 1: File Upload
 uploaded_file = st.file_uploader("Upload PDF File (Limit 200MB per file • PDF)", type=["pdf"])
 
 if uploaded_file is not None:
@@ -81,7 +81,7 @@ if uploaded_file is not None:
                 
                 vector_db = get_vector_store(chunks, file_bytes)
                 
-                # Tìm kiếm theo độ tương đồng (Similarity Search - Cơ bản)
+                # Định nghĩa cách tìm kiếm khi up pdf
                 st.session_state.retriever = vector_db.as_retriever(search_kwargs={"k": config.RETRIEVER_K})
                 
                 # Mục 7.2.4: Tìm kiếm Đa dạng hóa (MMR - Nâng cao)
