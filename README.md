@@ -11,7 +11,7 @@
 
 SmartDoc AI là hệ thống **RAG (Retrieval-Augmented Generation)** cho phép:
 
-- Hỏi đáp trực tiếp trên file PDF  
+- Hỏi đáp trực tiếp trên file PDF/DOCX  
 - Sử dụng AI (LLM)  
 
 Ứng dụng kết hợp:
@@ -23,10 +23,15 @@ SmartDoc AI là hệ thống **RAG (Retrieval-Augmented Generation)** cho phép:
 
 ## Tính năng nổi bật
 
-- Upload PDF trực tiếp
+- Upload PDF/DOCX trực tiếp
 - Tự động xử lý & tạo embeddings
 - Tìm kiếm ngữ nghĩa (semantic search)
 - Hỏi đáp bằng ngôn ngữ tự nhiên
+- Lưu lịch sử hội thoại theo session
+- Hiển thị lịch sử chat trong sidebar
+- Nút `Clear History` và `Clear Vector Store` có xác nhận trước khi xóa
+- Tùy chỉnh `chunk_size`, `chunk_overlap` trên UI
+- Benchmark chunk strategy với các cấu hình (500/1000/1500/2000) x (50/100/200)
 - UI đơn giản (Streamlit)
 - Không cần internet sau khi tải model
 
@@ -46,6 +51,7 @@ SmartDoc AI là hệ thống **RAG (Retrieval-Augmented Generation)** cho phép:
 |Ollama |Môi trường chạy LLM nội bộ (Local LLM runtime). |
 | PDFPlumber  | Trích xuất văn bản từ PDF (Ưu tiên). |
 | PyPDF   | Xử lý PDF dự phòng (Alternative). |
+| python-docx | Trích xuất văn bản từ DOCX (bao gồm đoạn văn và bảng). |
 | NumPy    | Tính toán số học.|
 | Pandas         | Thao tác và xử lý dữ liệu.|
 | Torch    | Backend cho Deep learning. |

@@ -26,19 +26,30 @@ def get_llm():
     except ImportError:
         return Ollama(model=config.LLM_MODEL, temperature=0.7)
 
-def get_vector_store(chunks, file_bytes: bytes):
-    """Sử dụng mã Hash để lưu và tải lại Vector Database từ ổ cứng."""
-    doc_hash = hashlib.sha256(file_bytes).hexdigest()
+def get_vector_store(
+    chunks,
+    file_bytes: bytes,
+    chunk_size: int | None = None,
+    chunk_overlap: int | None = None,
+    use_cache: bool = True,
+):
+    """Sử dụng mã Hash để lưu và tải lại Vector Database từ ổ cứng.
+
+    Cache key bao gồm cả chunk strategy để tránh tái sử dụng sai dữ liệu.
+    """
+    strategy_key = f"{chunk_size or config.CHUNK_SIZE}:{chunk_overlap or config.CHUNK_OVERLAP}"
+    doc_hash = hashlib.sha256(file_bytes + strategy_key.encode("utf-8")).hexdigest()
     persist_dir = config.FAISS_DIR / doc_hash
     embedder = get_embedding()
 
     # Nếu đã có cache trên ổ cứng, Load lên ngay lập tức
-    if persist_dir.exists() and any(persist_dir.iterdir()):
+    if use_cache and persist_dir.exists() and any(persist_dir.iterdir()):
         return FAISS.load_local(str(persist_dir), embedder, allow_dangerous_deserialization=True)
     
     # Nếu chưa có, tính toán Embedding và lưu xuống ổ cứng
     vector_db = FAISS.from_documents(chunks, embedder)
-    vector_db.save_local(str(persist_dir))
+    if use_cache:
+        vector_db.save_local(str(persist_dir))
     return vector_db
 
 def detect_language(text: str) -> str:

@@ -8,7 +8,7 @@ langchain-text-splitters
 langchain-ollama
 
 # Vector Database (FAISS)
-faiss-cpu==1.9.0
+faiss-cpu==1.9.0.post1
 
 # Các mô hình Embedding
 sentence-transformers
@@ -18,6 +18,7 @@ torch
 # Xử lý file PDF (Chính & Dự phòng)
 pdfplumber
 pypdf
+python-docx
 
 # Tiện ích bổ sung
 langdetect>=1.0.9
