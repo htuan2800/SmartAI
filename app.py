@@ -55,7 +55,8 @@ if "doc_hash" not in st.session_state:
     st.session_state.retriever = None
 
 # FEATURE 1: File Upload
-uploaded_file = st.file_uploader("Upload PDF File (Limit 200MB per file • PDF)", type=["pdf"])
+disable_upload = st.session_state.get("query_input", "") != ""
+uploaded_file = st.file_uploader("Upload PDF File (Limit 200MB per file • PDF)", type=["pdf"], disabled=disable_upload)
 
 if uploaded_file is not None:
     file_bytes = uploaded_file.getvalue()
@@ -67,6 +68,7 @@ if uploaded_file is not None:
     # Xử lý nếu là file mới hoàn toàn
     if st.session_state.doc_hash != new_hash or st.session_state.retriever is None:
         # Match user flow: "Xem progress Splitting... và Creating embeddings..."
+        st.session_state.query_input = "" # Reset ô nhập liệu câu hỏi khi up file mới
         with st.spinner("Processing document (Splitting & Creating embeddings)..."):
             try:
                 # Lưu file tạm
@@ -102,12 +104,23 @@ if uploaded_file is not None:
                 st.info("**Xử lý lỗi:** Check file format (phải là PDF hợp lệ không bị hỏng). Nếu lỗi khác: Xem error message bên dưới và retry.")
                 st.code(str(e)) # In rõ error message ra
                 st.stop()
+else:
+    # Nếu không có file (hoặc người dùng bấm X xóa file), reset toàn bộ hệ thống
+    if st.session_state.doc_hash is not None:
+        # Dọn dẹp sạch sẽ bộ nhớ
+        st.session_state.doc_hash = None
+        st.session_state.retriever = None
+        if "query_input" in st.session_state:
+            st.session_state.query_input = ""
+        
+        # Ép Streamlit tải lại giao diện ngay lập tức
+        st.rerun()
 
 # FEATURE 2: Question Answering 
 if st.session_state.retriever is not None:
     st.markdown("---")
     st.subheader("Ask a Question")
-    query = st.text_input("Enter your question based on the document:")
+    query = st.text_input("Enter your question based on the document:", key="query_input")
     
     if query:
         # Phần nâng cao 7.2.5: Cấu hình logging để theo dõi câu hỏi và số lượng tài liệu được truy xuất
