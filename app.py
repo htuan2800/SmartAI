@@ -1,6 +1,9 @@
 import hashlib
+import html
 import logging
+import re
 import shutil
+import time
 from pathlib import Path
 
 import pandas as pd
@@ -8,23 +11,97 @@ import streamlit as st
 
 import config
 from document_processor import load_and_split_document
-from rag_engine import ask_question, get_llm, get_vector_store
+from rag_engine import ask_question, build_retrievers, get_conversational_chain, get_llm, get_vector_store
 
 # Phần nâng cao 7.2.5: Cấu hình logging để theo dõi quá trình truy xuất và xử lý
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
+STOPWORDS = {
+    "va", "là", "la", "the", "and", "for", "with", "from", "that", "this", "what", "how",
+    "cua", "của", "cho", "để", "tren", "trên", "duoc", "được", "hay", "trong", "when", "where",
+    "why", "who", "which", "một", "những", "các", "với", "about", "into", "yêu", "cầu",
+}
+
+
+def parse_cited_pages(answer: str):
+    """Lấy danh sách trang được model nhắc trực tiếp trong câu trả lời, ví dụ (Page 12) hoặc (Trang 12)."""
+    matches = re.findall(r"\((?:page|trang)\s*(\d+)\)", answer or "", flags=re.IGNORECASE)
+    return sorted({int(page) for page in matches if int(page) >= 1})
+
+
+def prettify_source_name(source: str):
+    """Rút gọn tên source đang có dạng hash_tenfile để UI dễ đọc."""
+    name = Path(source or "").name
+    # Trường hợp upload đang lưu dạng <hash>_<original_filename>
+    if re.match(r"^[a-f0-9]{64}_", name):
+        return name[65:]
+    return name
+
+
+def group_sources_by_page(source_items):
+    """Nhóm các chunk theo page để khi bấm vào 1 nguồn chỉ hiện đúng nhóm context của page đó."""
+    grouped = {}
+    for item in source_items or []:
+        page = int(item.get("page", 0) or 0)
+        if page < 1:
+            continue
+
+        source_name = prettify_source_name(item.get("source", ""))
+        grouped.setdefault(page, {"source": source_name, "chunks": []})
+        grouped[page]["chunks"].append(item.get("content", ""))
+
+    return grouped
+
+
+def extract_query_terms(query: str):
+    """Tách từ khóa chính từ câu hỏi để highlight trong context nguồn."""
+    tokens = re.findall(r"[A-Za-zÀ-ỹ0-9]{3,}", query.lower())
+    terms = []
+    for token in tokens:
+        if token not in STOPWORDS and token not in terms:
+            terms.append(token)
+    return terms[:12]
+
+
+def highlight_text(text: str, terms):
+    """Bọc <mark> cho các từ khóa xuất hiện trong đoạn nguồn để người dùng nhìn nhanh phần liên quan."""
+    safe_text = html.escape(text or "")
+    for term in sorted(terms, key=len, reverse=True):
+        pattern = re.compile(re.escape(html.escape(term)), flags=re.IGNORECASE)
+        safe_text = pattern.sub(lambda m: f"<mark>{m.group(0)}</mark>", safe_text)
+    return safe_text
+
+
 def init_session_state():
     defaults = {
         "doc_hash": None,
         "retriever": None,
+        "vector_retriever": None,
+        "bm25_retriever": None,
+        "hybrid_retriever": None,
+        "conversation_chain": None,
+        "llm": None,
         "current_file_path": None,
         "current_file_bytes": None,
+        "current_chunks": [],
         "chat_history": [],
         "latest_answer": "",
+        "latest_question": "",
+        "latest_sources": [],
+        "latest_source_items": [],
+        "selected_source_page": None,
         "chunk_size": config.CHUNK_SIZE,
         "chunk_overlap": config.CHUNK_OVERLAP,
+        "search_mode": "Hybrid" if config.USE_HYBRID_DEFAULT else "Vector",
+        "use_hybrid": bool(config.USE_HYBRID_DEFAULT),
+        "bm25_k": config.BM25_K,
+        "hybrid_weight_vector": float(config.HYBRID_WEIGHTS[0]),
+        "hybrid_weight_bm25": float(config.HYBRID_WEIGHTS[1]),
+        "retriever_signature": None,
+        "latest_retrieval_metrics": None,
+        "compare_search": bool(config.SHOW_RETRIEVAL_COMPARISON),
         "benchmark_input": "",
     }
     for key, value in defaults.items():
@@ -33,8 +110,27 @@ def init_session_state():
 
 
 def clear_history_state():
+    # Reset cả UI history lẫn memory trong conversational chain.
+    chain = st.session_state.get("conversation_chain")
+    if chain is not None and getattr(chain, "memory", None) is not None:
+        chain.memory.clear()
+
+    # Re-create chain mới để tránh giữ state nội bộ từ phiên trước.
+    if st.session_state.get("retriever") is not None:
+        if st.session_state.get("llm") is None:
+            st.session_state.llm = get_llm()
+        st.session_state.conversation_chain = get_conversational_chain(
+            st.session_state.retriever,
+            st.session_state.llm,
+            window_size=config.MEMORY_WINDOW_SIZE,
+        )
+
     st.session_state.chat_history = []
     st.session_state.latest_answer = ""
+    st.session_state.latest_question = ""
+    st.session_state.latest_sources = []
+    st.session_state.latest_source_items = []
+    st.session_state.selected_source_page = None
 
 
 def clear_vector_store_state():
@@ -47,8 +143,16 @@ def clear_vector_store_state():
 
     st.session_state.doc_hash = None
     st.session_state.retriever = None
+    st.session_state.vector_retriever = None
+    st.session_state.bm25_retriever = None
+    st.session_state.hybrid_retriever = None
+    st.session_state.conversation_chain = None
+    st.session_state.llm = None
     st.session_state.current_file_path = None
     st.session_state.current_file_bytes = None
+    st.session_state.current_chunks = []
+    st.session_state.retriever_signature = None
+    st.session_state.latest_retrieval_metrics = None
 
 
 def parse_benchmark_cases(raw_text: str):
@@ -62,6 +166,106 @@ def parse_benchmark_cases(raw_text: str):
         if question.strip() and keywords:
             cases.append({"question": question.strip(), "keywords": keywords})
     return cases
+
+
+def build_retriever_signature():
+    """Tạo chữ ký cấu hình retrieval để biết khi nào cần rebuild retriever/chain."""
+    return "|".join(
+        [
+            str(st.session_state.doc_hash),
+            str(st.session_state.chunk_size),
+            str(st.session_state.chunk_overlap),
+            str(st.session_state.search_mode),
+            str(int(st.session_state.bm25_k)),
+            f"{float(st.session_state.hybrid_weight_vector):.3f}",
+            f"{float(st.session_state.hybrid_weight_bm25):.3f}",
+        ]
+    )
+
+
+def configure_retrievers_and_chain(chunks, file_bytes: bytes):
+    """Khởi tạo vector/BM25/hybrid retriever và gắn chain theo mode đang chọn.
+
+    Hybrid search dùng EnsembleRetriever để phối hợp 2 tín hiệu:
+    - Semantic (FAISS): hiểu ngữ nghĩa câu hỏi.
+    - Keyword (BM25): bám từ khóa chính xác.
+    """
+    vector_db = get_vector_store(
+        chunks,
+        file_bytes,
+        chunk_size=int(st.session_state.chunk_size),
+        chunk_overlap=int(st.session_state.chunk_overlap),
+    )
+
+    retriever_bundle = build_retrievers(
+        vector_db=vector_db,
+        chunks=chunks,
+        vector_k=int(config.RETRIEVER_K),
+        bm25_k=int(st.session_state.bm25_k),
+        weights=[
+            float(st.session_state.hybrid_weight_vector),
+            float(st.session_state.hybrid_weight_bm25),
+        ],
+        use_hybrid=True,
+    )
+
+    st.session_state.vector_retriever = retriever_bundle["vector"]
+    st.session_state.bm25_retriever = retriever_bundle["bm25"]
+    st.session_state.hybrid_retriever = retriever_bundle["hybrid"]
+
+    use_hybrid_mode = st.session_state.search_mode == "Hybrid" and st.session_state.hybrid_retriever is not None
+    st.session_state.use_hybrid = bool(use_hybrid_mode)
+    st.session_state.retriever = st.session_state.hybrid_retriever if use_hybrid_mode else st.session_state.vector_retriever
+
+    if st.session_state.llm is None:
+        st.session_state.llm = get_llm()
+
+    st.session_state.conversation_chain = get_conversational_chain(
+        st.session_state.retriever,
+        st.session_state.llm,
+        window_size=config.MEMORY_WINDOW_SIZE,
+    )
+    st.session_state.retriever_signature = build_retriever_signature()
+
+
+def compare_vector_vs_hybrid(query: str):
+    """So sánh query time + số lượng docs truy xuất giữa Vector và Hybrid cho cùng câu hỏi."""
+    metrics = {}
+
+    def _safe_page_value(value):
+        try:
+            parsed = int(value)
+            return parsed if parsed >= 1 else 1
+        except (TypeError, ValueError):
+            return 1
+
+    def _measure(name, retriever_obj):
+        if retriever_obj is None:
+            return
+        start = time.perf_counter()
+        docs = retriever_obj.invoke(query)
+        elapsed_ms = round((time.perf_counter() - start) * 1000, 2)
+        pages = sorted({_safe_page_value((doc.metadata or {}).get("page", 1)) for doc in docs})
+        top_sources = []
+        for doc in docs[:3]:
+            metadata = doc.metadata or {}
+            top_sources.append(f"{metadata.get('source', 'Unknown')} - Page {_safe_page_value(metadata.get('page', 1))}")
+        metrics[name] = {
+            "query_time_ms": elapsed_ms,
+            "num_docs": len(docs),
+            "pages": pages,
+            "top_sources": top_sources,
+        }
+
+    _measure("vector", st.session_state.vector_retriever)
+    _measure("hybrid", st.session_state.hybrid_retriever)
+
+    if "vector" in metrics and "hybrid" in metrics:
+        vector_pages = set(metrics["vector"]["pages"])
+        hybrid_pages = set(metrics["hybrid"]["pages"])
+        metrics["page_overlap"] = sorted(vector_pages.intersection(hybrid_pages))
+
+    return metrics
 
 
 @st.dialog("Confirm Clear History")
@@ -127,6 +331,50 @@ with st.sidebar:
     """
     )
 
+    st.markdown("---")
+    st.header("Retrieval Strategy")
+    st.caption("Hybrid Search = Semantic (FAISS) + Keyword (BM25) để tăng độ bám ngữ nghĩa và từ khóa.")
+
+    st.session_state.search_mode = st.radio(
+        "Search Mode",
+        options=["Hybrid", "Vector"],
+        index=0 if st.session_state.search_mode == "Hybrid" else 1,
+        horizontal=True,
+    )
+
+    st.session_state.bm25_k = st.number_input(
+        "BM25 Top-k",
+        min_value=1,
+        max_value=20,
+        step=1,
+        value=int(st.session_state.bm25_k),
+    )
+
+    vector_w = st.slider(
+        "Weight: Vector",
+        min_value=0.0,
+        max_value=1.0,
+        value=float(st.session_state.hybrid_weight_vector),
+        step=0.05,
+    )
+    bm25_w = st.slider(
+        "Weight: BM25",
+        min_value=0.0,
+        max_value=1.0,
+        value=float(st.session_state.hybrid_weight_bm25),
+        step=0.05,
+    )
+
+    if vector_w + bm25_w == 0:
+        st.warning("Tổng weights đang bằng 0, hệ thống tự fallback về [0.5, 0.5].")
+
+    st.session_state.hybrid_weight_vector = float(vector_w)
+    st.session_state.hybrid_weight_bm25 = float(bm25_w)
+    st.session_state.compare_search = st.checkbox(
+        "So sánh Vector vs Hybrid theo từng query",
+        value=bool(st.session_state.compare_search),
+    )
+
     with st.expander("Chunk Strategy", expanded=False):
         st.caption("Tùy chỉnh chunk parameters để tối ưu retrieval cho từng tài liệu.")
         use_custom = st.checkbox("Use custom values", value=False)
@@ -166,10 +414,19 @@ with st.sidebar:
             with st.expander(f"Q{len(st.session_state.chat_history) - idx + 1}: {item['question'][:70]}"):
                 st.markdown(f"**Q:** {item['question']}")
                 st.markdown(f"**A:** {item['answer']}")
+                if item.get("source_items"):
+                    with st.expander("Nguồn tham chiếu (đã highlight)", expanded=False):
+                        terms = extract_query_terms(item.get("question", ""))
+                        for source_item in item["source_items"]:
+                            st.markdown(
+                                f"**{source_item['source']} - Page {source_item['page']}**"
+                            )
+                            rendered = highlight_text(source_item.get("content", ""), terms)
+                            st.markdown(rendered, unsafe_allow_html=True)
     else:
         st.caption("Chưa có lịch sử hội thoại.")
 
-    if st.button("Clear History", use_container_width=True):
+    if st.button("Clear Chat History", use_container_width=True):
         confirm_clear_history_dialog()
     if st.button("Clear Vector Store", use_container_width=True):
         confirm_clear_vector_dialog()
@@ -207,16 +464,13 @@ if uploaded_file is not None:
                 )
                 logger.info(f"Processing {len(chunks)} chunks")
 
-                vector_db = get_vector_store(
-                    chunks,
-                    file_bytes,
-                    chunk_size=int(st.session_state.chunk_size),
-                    chunk_overlap=int(st.session_state.chunk_overlap),
-                )
-                st.session_state.retriever = vector_db.as_retriever(search_kwargs={"k": config.RETRIEVER_K})
+                # Tạo đồng thời retriever vector/BM25/hybrid để có thể đổi mode ngay trên UI.
                 st.session_state.doc_hash = new_hash
+                configure_retrievers_and_chain(chunks, file_bytes)
                 st.session_state.current_file_bytes = file_bytes
                 st.session_state.current_file_path = str(file_path)
+                st.session_state.current_chunks = chunks
+                st.session_state.latest_retrieval_metrics = None
 
                 st.success(f"{uploaded_file.name} uploaded successfully!")
             except Exception as e:
@@ -225,30 +479,141 @@ if uploaded_file is not None:
                 st.code(str(e))
                 st.stop()
 
+# Nếu user đổi mode retrieval/weights/BM25-k sau khi upload, rebuild retriever + chain tương ứng.
+if st.session_state.doc_hash and st.session_state.current_chunks:
+    latest_signature = build_retriever_signature()
+    if latest_signature != st.session_state.retriever_signature:
+        try:
+            configure_retrievers_and_chain(st.session_state.current_chunks, st.session_state.current_file_bytes)
+            logger.info("Retriever pipeline has been rebuilt due to retrieval settings changes")
+        except Exception as e:
+            st.error("Không thể cập nhật retrieval strategy với cấu hình hiện tại.")
+            st.code(str(e))
+
 # FEATURE 2: Question Answering
 if st.session_state.retriever is not None:
     st.markdown("---")
-    st.subheader("Ask a Question")
-    with st.form("qa_form", clear_on_submit=True):
-        query = st.text_input("Enter your question based on the document:")
-        submitted = st.form_submit_button("Ask")
+    st.subheader("Conversational Q&A")
+    st.caption(f"Active retrieval mode: **{st.session_state.search_mode}**")
 
-    if submitted and query.strip():
+    # Nếu app reload nhưng chain chưa có (hoặc đang dùng memory format cũ), tự dựng lại.
+    chain = st.session_state.conversation_chain
+    needs_rebuild = chain is None
+    if chain is not None and getattr(chain, "memory", None) is not None:
+        # Tránh lỗi Unsupported chat history format khi chain cũ trả history dạng string.
+        if getattr(chain.memory, "return_messages", True) is False:
+            needs_rebuild = True
+
+    if needs_rebuild:
+        if st.session_state.llm is None:
+            st.session_state.llm = get_llm()
+        st.session_state.conversation_chain = get_conversational_chain(
+            st.session_state.retriever,
+            st.session_state.llm,
+            window_size=config.MEMORY_WINDOW_SIZE,
+        )
+
+    # Hiển thị lịch sử theo dạng chat app.
+    for item in st.session_state.chat_history:
+        with st.chat_message("user"):
+            st.markdown(item["question"])
+        with st.chat_message("assistant"):
+            st.markdown(item["answer"])
+
+    query = st.chat_input("Nhập câu hỏi về tài liệu (hỗ trợ follow-up như: 'nó là gì?')")
+
+    if query and query.strip():
         logger.info(f"Query: {query}")
         with st.spinner("Processing your query..."):
             try:
-                llm = get_llm()
-                answer = ask_question(query.strip(), st.session_state.retriever, llm)
+                if st.session_state.compare_search:
+                    st.session_state.latest_retrieval_metrics = compare_vector_vs_hybrid(query.strip())
+                    logger.info(f"Retrieval compare metrics: {st.session_state.latest_retrieval_metrics}")
+                else:
+                    st.session_state.latest_retrieval_metrics = None
+
+                # Conversational chain tự dùng memory + retrieval để xử lý câu hỏi follow-up.
+                answer, source_pages, source_items = ask_question(
+                    query.strip(),
+                    chain=st.session_state.conversation_chain,
+                    llm=st.session_state.llm,
+                    return_sources=True,
+                    return_source_items=True,
+                )
                 st.session_state.latest_answer = answer
-                st.session_state.chat_history.append({"question": query.strip(), "answer": answer})
+                st.session_state.latest_question = query.strip()
+                # Loại trùng + sắp xếp tăng dần để danh sách nguồn ổn định, dễ kiểm tra.
+                st.session_state.latest_sources = sorted({int(page) for page in source_pages if int(page) >= 1})
+                st.session_state.latest_source_items = source_items
+                st.session_state.selected_source_page = None
+                st.session_state.chat_history.append(
+                    {
+                        "question": query.strip(),
+                        "answer": answer,
+                        "sources": st.session_state.latest_sources,
+                        "source_items": source_items,
+                    }
+                )
             except Exception as e:
                 st.error("Không có response từ Model!")
                 st.info("Kiểm tra Ollama đang chạy, sau đó thử lại.")
                 st.code(str(e))
 
+    if st.session_state.latest_retrieval_metrics:
+        st.markdown("**Retrieval Performance (Vector vs Hybrid):**")
+        rows = []
+        for mode in ["vector", "hybrid"]:
+            if mode in st.session_state.latest_retrieval_metrics:
+                item = st.session_state.latest_retrieval_metrics[mode]
+                rows.append(
+                    {
+                        "mode": mode,
+                        "query_time_ms": item["query_time_ms"],
+                        "num_docs": item["num_docs"],
+                        "pages": ", ".join(str(p) for p in item["pages"][:8]),
+                        "top_sources": " | ".join(item["top_sources"]),
+                    }
+                )
+
+        if rows:
+            st.dataframe(pd.DataFrame(rows), use_container_width=True)
+
+        overlap = st.session_state.latest_retrieval_metrics.get("page_overlap", [])
+        st.caption(f"Page overlap giữa Vector và Hybrid: {overlap if overlap else 'không có'}")
+
     if st.session_state.latest_answer:
         st.subheader("Response:")
         st.write(st.session_state.latest_answer)
+
+        # Ưu tiên trang được nhắc trực tiếp trong answer. Nếu model chưa gắn citation, fallback theo trang retrieve.
+        cited_pages = parse_cited_pages(st.session_state.latest_answer)
+        pages_for_buttons = cited_pages or st.session_state.latest_sources
+
+        grouped_sources = group_sources_by_page(st.session_state.latest_source_items)
+
+        if pages_for_buttons:
+            st.markdown("**Nguồn tham chiếu:**")
+            for page in pages_for_buttons:
+                source_name = grouped_sources.get(page, {}).get("source", "document")
+                chip_label = f"📄 {source_name} • Page {page}"
+                if st.button(chip_label, key=f"show_source_page_{page}"):
+                        st.session_state.selected_source_page = page
+
+        selected_page = st.session_state.selected_source_page
+        if selected_page and st.session_state.latest_source_items:
+            st.markdown("**Highlight các đoạn văn được sử dụng để trả lời:**")
+            st.markdown(f"Trang đang xem: **Page {selected_page}**")
+            terms = extract_query_terms(st.session_state.latest_question)
+            chunks = grouped_sources.get(int(selected_page), {}).get("chunks", [])
+            source_name = grouped_sources.get(int(selected_page), {}).get("source", "document")
+
+            if not chunks:
+                st.info("Không tìm thấy chunk tương ứng cho trang này trong top-k retrieval hiện tại.")
+            else:
+                for idx, chunk in enumerate(chunks, start=1):
+                    with st.expander(f"{source_name} - Page {selected_page} - Chunk {idx}", expanded=True):
+                        rendered = highlight_text(chunk, terms)
+                        st.markdown(rendered, unsafe_allow_html=True)
 
     st.markdown("---")
     st.subheader("Chunk Strategy Evaluation")

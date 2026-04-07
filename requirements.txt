@@ -6,6 +6,7 @@ langchain>=0.3.16
 langchain-community>=0.3.16
 langchain-text-splitters
 langchain-ollama
+rank-bm25
 
 # Vector Database (FAISS)
 faiss-cpu==1.9.0.post1

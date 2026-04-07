@@ -16,12 +16,16 @@ CHUNK_SIZE = 1000
 CHUNK_OVERLAP = 100
 EMBEDDING_MODEL = "sentence-transformers/paraphrase-multilingual-mpnet-base-v2"
 LLM_MODEL = "qwen2.5:7b"
-RETRIEVER_K = 4 # Tăng lên 4 để lấy nhiều ngữ cảnh hơn
+RETRIEVER_K = 4  # Top-k cho semantic/vector retrieval
+BM25_K = 4       # Top-k cho keyword retrieval bằng BM25
+USE_HYBRID_DEFAULT = True
+HYBRID_WEIGHTS = (0.5, 0.5)  # (vector_weight, bm25_weight)
+SHOW_RETRIEVAL_COMPARISON = True
+MEMORY_WINDOW_SIZE = 10  # Số lượt hội thoại gần nhất giữ trong Conversational RAG memory
 
 
 
 #phần nâng cao 7.2.4
 SEARCH_TYPE = "mmr"   # Thuật toán Maximum Marginal Relevance
-RETRIEVER_K = 5       # Lấy 5 kết quả
 FETCH_K = 30          # Lấy 30 kết quả thô ban đầu
 LAMBDA_MULT = 0.7     # Độ đa dạng của kết quả
