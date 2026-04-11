@@ -16,7 +16,7 @@ CHUNK_SIZE = 1000
 CHUNK_OVERLAP = 100
 EMBEDDING_MODEL = "sentence-transformers/paraphrase-multilingual-mpnet-base-v2"
 LLM_MODEL = "qwen2.5:7b"
-RETRIEVER_K = 4  # Top-k cho semantic/vector retrieval
+RETRIEVER_K = 20  # Top-k cho semantic/vector retrieval
 BM25_K = 4       # Top-k cho keyword retrieval bằng BM25
 USE_HYBRID_DEFAULT = True
 HYBRID_WEIGHTS = (0.5, 0.5)  # (vector_weight, bm25_weight)
@@ -29,3 +29,9 @@ MEMORY_WINDOW_SIZE = 10  # Số lượt hội thoại gần nhất giữ trong C
 SEARCH_TYPE = "mmr"   # Thuật toán Maximum Marginal Relevance
 FETCH_K = 30          # Lấy 30 kết quả thô ban đầu
 LAMBDA_MULT = 0.7     # Độ đa dạng của kết quả
+
+# Cấu hình Re-ranker
+USE_RERANKER = True
+RERANK_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"
+TOP_K_RERANK = 10  # Số lượng đoạn văn đưa vào để re-rank
+FINAL_K = 4        # Số lượng đoạn văn cuối cùng đưa vào LLM

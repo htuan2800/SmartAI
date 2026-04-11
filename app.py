@@ -49,7 +49,13 @@ def group_sources_by_page(source_items):
             continue
 
         source_name = prettify_source_name(item.get("source", ""))
-        grouped.setdefault(page, {"source": source_name, "chunks": []})
+        if page not in grouped:
+            grouped[page] = {
+                "source": source_name,
+                "chunks": [],
+                "upload_at": item.get("upload_at", "N/A"),
+                "file_type": item.get("file_type", "N/A")
+            }
         grouped[page]["chunks"].append(item.get("content", ""))
 
     return grouped
@@ -179,11 +185,12 @@ def build_retriever_signature():
             str(int(st.session_state.bm25_k)),
             f"{float(st.session_state.hybrid_weight_vector):.3f}",
             f"{float(st.session_state.hybrid_weight_bm25):.3f}",
+            str(st.session_state.get("active_filter")), # Thêm dòng này
         ]
     )
 
 
-def configure_retrievers_and_chain(chunks, file_bytes: bytes):
+def configure_retrievers_and_chain(chunks, files_identifier: str):
     """Khởi tạo vector/BM25/hybrid retriever và gắn chain theo mode đang chọn.
 
     Hybrid search dùng EnsembleRetriever để phối hợp 2 tín hiệu:
@@ -192,10 +199,13 @@ def configure_retrievers_and_chain(chunks, file_bytes: bytes):
     """
     vector_db = get_vector_store(
         chunks,
-        file_bytes,
+        files_identifier,
         chunk_size=int(st.session_state.chunk_size),
         chunk_overlap=int(st.session_state.chunk_overlap),
     )
+
+    # Tham số filter_metadata lấy từ session_state
+    filter_meta = st.session_state.get("active_filter")
 
     retriever_bundle = build_retrievers(
         vector_db=vector_db,
@@ -207,6 +217,7 @@ def configure_retrievers_and_chain(chunks, file_bytes: bytes):
             float(st.session_state.hybrid_weight_bm25),
         ],
         use_hybrid=True,
+        filter_metadata=filter_meta, # Thêm dòng này
     )
 
     st.session_state.vector_retriever = retriever_bundle["vector"]
@@ -375,6 +386,46 @@ with st.sidebar:
         value=bool(st.session_state.compare_search),
     )
 
+    st.markdown("---")
+    st.header("Filter Settings")
+    
+    # Lấy danh sách file duy nhất từ các chunks hiện có, hiển thị tên gốc kèm thời gian upload
+    if st.session_state.current_chunks:
+        from pathlib import Path
+        import re
+        # Tạo danh sách tuple (label, source_full)
+        file_infos = {}
+        for chunk in st.session_state.current_chunks:
+            meta = chunk.metadata or {}
+            source = meta.get("source")
+            upload_at = meta.get("upload_at", "?")
+            name = Path(source or "").name
+            if re.match(r"^[a-f0-9]{64}_", name):
+                pretty = name[65:]
+            else:
+                pretty = name
+            label = f"{pretty} ({upload_at})"
+            # Nếu trùng label (file trùng tên, cùng thời gian), chỉ lấy 1
+            file_infos[label] = source
+
+        labels_sorted = sorted(file_infos.keys())
+        selected_labels = st.multiselect("Lọc theo tài liệu:", options=labels_sorted, default=[])
+
+        # Tạo filter dictionary
+        if selected_labels:
+            # Lấy danh sách source_full tương ứng các label được chọn
+            selected_sources = [file_infos[label] for label in selected_labels]
+            # Nếu chỉ chọn 1 file thì truyền string, nếu nhiều file thì truyền list
+            if len(selected_sources) == 1:
+                st.session_state.active_filter = {"source": selected_sources[0]}
+            else:
+                st.session_state.active_filter = {"source": selected_sources}
+            st.info(f"Đang lọc: {', '.join(selected_labels)}")
+        else:
+            st.session_state.active_filter = None
+    else:
+        st.session_state.active_filter = None
+
     with st.expander("Chunk Strategy", expanded=False):
         st.caption("Tùy chỉnh chunk parameters để tối ưu retrieval cho từng tài liệu.")
         use_custom = st.checkbox("Use custom values", value=False)
@@ -437,54 +488,106 @@ st.title("Intelligent Document Q&A System")
 st.caption("RAG System với LLMs - Tối ưu hóa: Caching, Fallback, LangDetect")
 
 # FEATURE 1: File Upload (PDF + DOCX)
-uploaded_file = st.file_uploader(
+
+# --- VALIDATE UPLOAD ---
+MAX_FILES = 10
+MAX_FILE_SIZE = 200 * 1024 * 1024  # 200MB
+ALLOWED_EXTS = {".pdf", ".docx"}
+
+uploaded_files = st.file_uploader(
     "Upload File (Limit 200MB per file • PDF, DOCX)",
     type=["pdf", "docx"],
+    accept_multiple_files=True
 )
 
-if uploaded_file is not None:
-    file_bytes = uploaded_file.getvalue()
-    strategy_key = f"{st.session_state.chunk_size}:{st.session_state.chunk_overlap}".encode("utf-8")
-    new_hash = hashlib.sha256(file_bytes + strategy_key).hexdigest()
+if uploaded_files and len(uploaded_files) > 0:
+    # Validate số lượng file
+    if len(uploaded_files) > MAX_FILES:
+        st.error(f"Chỉ được upload tối đa {MAX_FILES} file/lần.")
+        st.stop()
 
-    if uploaded_file.size > 50 * 1024 * 1024:
-        st.warning("File tải lên lớn hơn 50MB. Quá trình xử lý có thể kéo dài, vui lòng chờ.")
+    # Validate từng file
+    file_errors = []
+    for f in uploaded_files:
+        ext = Path(f.name).suffix.lower()
+        if ext not in ALLOWED_EXTS:
+            file_errors.append(f"❌ {f.name}: Định dạng không hợp lệ (chỉ nhận PDF/DOCX)")
+        if f.size > MAX_FILE_SIZE:
+            file_errors.append(f"❌ {f.name}: Dung lượng vượt quá 200MB")
+    if file_errors:
+        st.error("\n".join(file_errors))
+        st.stop()
+
+    # 1. Tạo một chuỗi định danh duy nhất cho nhóm file này
+    files_identifier = "-".join(sorted([f"{f.name}_{f.size}" for f in uploaded_files]))
+    strategy_key = f"{st.session_state.chunk_size}:{st.session_state.chunk_overlap}"
+    new_hash = hashlib.sha256((files_identifier + strategy_key).encode("utf-8")).hexdigest()
+
+
+    total_size = sum(f.size for f in uploaded_files)
+    if total_size > 200 * 1024 * 1024:
+        st.warning(f"Tổng dung lượng tất cả file ({total_size / (1024*1024):.2f} MB) vượt quá 200MB. Có thể gây quá tải bộ nhớ hoặc lỗi xử lý.")
+    elif total_size > 50 * 1024 * 1024:
+        st.warning(f"Tổng dung lượng file ({total_size / (1024*1024):.2f} MB) lớn hơn 50MB. Quá trình xử lý có thể kéo dài.")
 
     if st.session_state.doc_hash != new_hash or st.session_state.retriever is None:
-        with st.spinner("Processing document (Splitting & Creating embeddings)..."):
-            try:
-                raw_hash = hashlib.sha256(file_bytes).hexdigest()
-                file_path = config.UPLOAD_DIR / f"{raw_hash}_{uploaded_file.name}"
-                file_path.write_bytes(file_bytes)
+        with st.spinner(f"Processing document (Splitting & Creating embeddings)..."):
+            all_chunks = []
+            current_file_paths = []
+            file_process_errors = []
+            for uploaded_file in uploaded_files:
+                try:
+                    file_bytes = uploaded_file.getvalue()
+                    raw_hash = hashlib.sha256(file_bytes).hexdigest()
+                    clean_name = re.sub(r'[\\/*?:"<>|]', "_", uploaded_file.name)
+                    file_path = config.UPLOAD_DIR / f"{raw_hash}_{uploaded_file.name}"
+                    if not file_path.exists():
+                        file_path.write_bytes(file_bytes)
+                    current_file_paths.append(str(file_path))
 
-                chunks = load_and_split_document(
-                    str(file_path),
-                    chunk_size=int(st.session_state.chunk_size),
-                    chunk_overlap=int(st.session_state.chunk_overlap),
-                )
-                logger.info(f"Processing {len(chunks)} chunks")
+                    chunks = load_and_split_document(
+                        str(file_path),
+                        chunk_size=int(st.session_state.chunk_size),
+                        chunk_overlap=int(st.session_state.chunk_overlap),
+                    )
+                    logger.info(f"Processing {len(chunks)} chunks")
+                    all_chunks.extend(chunks)
+                except Exception as e:
+                    file_process_errors.append(f"❌ {uploaded_file.name}: {str(e)}")
 
-                # Tạo đồng thời retriever vector/BM25/hybrid để có thể đổi mode ngay trên UI.
-                st.session_state.doc_hash = new_hash
-                configure_retrievers_and_chain(chunks, file_bytes)
-                st.session_state.current_file_bytes = file_bytes
-                st.session_state.current_file_path = str(file_path)
-                st.session_state.current_chunks = chunks
-                st.session_state.latest_retrieval_metrics = None
-
-                st.success(f"{uploaded_file.name} uploaded successfully!")
-            except Exception as e:
-                st.error("Upload/Processing fail!")
-                st.info("Kiểm tra file hợp lệ (PDF/DOCX) hoặc thử lại.")
-                st.code(str(e))
+            # Validate tổng số chunk tối đa
+            MAX_TOTAL_CHUNKS = 10000
+            if len(all_chunks) > MAX_TOTAL_CHUNKS:
+                st.error(f"Tổng số chunk ({len(all_chunks)}) vượt quá giới hạn {MAX_TOTAL_CHUNKS}. Hãy giảm số lượng hoặc dung lượng file.")
                 st.stop()
+
+            if file_process_errors:
+                st.error("Một số file bị lỗi khi xử lý:\n" + "\n".join(file_process_errors))
+                if not all_chunks:
+                    st.stop()
+
+            # Tạo đồng thời retriever vector/BM25/hybrid để có thể đổi mode ngay trên UI.
+            st.session_state.doc_hash = new_hash
+            vector_db = get_vector_store(
+                all_chunks,
+                files_identifier, 
+                chunk_size=int(st.session_state.chunk_size),
+                chunk_overlap=int(st.session_state.chunk_overlap),
+            )
+            configure_retrievers_and_chain(all_chunks, files_identifier)
+            st.session_state.current_file_path = current_file_paths[0] if current_file_paths else None
+            st.session_state.current_chunks = all_chunks
+            st.session_state.current_files_identifier = files_identifier
+            st.session_state.latest_retrieval_metrics = None
+
+            st.success(f"Đã upload thành công {len(all_chunks)} chunk từ {len(uploaded_files)} file.")
 
 # Nếu user đổi mode retrieval/weights/BM25-k sau khi upload, rebuild retriever + chain tương ứng.
 if st.session_state.doc_hash and st.session_state.current_chunks:
     latest_signature = build_retriever_signature()
     if latest_signature != st.session_state.retriever_signature:
         try:
-            configure_retrievers_and_chain(st.session_state.current_chunks, st.session_state.current_file_bytes)
+            configure_retrievers_and_chain(st.session_state.current_chunks, st.session_state.current_files_identifier)
             logger.info("Retriever pipeline has been rebuilt due to retrieval settings changes")
         except Exception as e:
             st.error("Không thể cập nhật retrieval strategy với cấu hình hiện tại.")
@@ -519,45 +622,73 @@ if st.session_state.retriever is not None:
             st.markdown(item["question"])
         with st.chat_message("assistant"):
             st.markdown(item["answer"])
+            # Hiển thị Self-eval nếu có
+            if item.get("self_eval_score"):
+                st.info(f"**Self-Eval:** {item['self_eval_score']}")
+            # Hiển thị câu hỏi đã rewrite nếu có
+            if item.get("rewritten_query") and item["rewritten_query"] != item["question"]:
+                st.caption(f"Câu hỏi đã rewrite: {item['rewritten_query']}")
+            # Hiển thị các bước multi-hop nếu có
+            if item.get("multihop_steps"):
+                with st.expander("Multi-hop reasoning steps", expanded=False):
+                    for idx, step in enumerate(item["multihop_steps"], 1):
+                        st.markdown(f"**Bước {idx}:** {step['question']}")
+                        st.markdown(f"Trả lời: {step['answer']}")
+
 
     query = st.chat_input("Nhập câu hỏi về tài liệu (hỗ trợ follow-up như: 'nó là gì?')")
 
     if query and query.strip():
-        logger.info(f"Query: {query}")
-        with st.spinner("Processing your query..."):
-            try:
-                if st.session_state.compare_search:
-                    st.session_state.latest_retrieval_metrics = compare_vector_vs_hybrid(query.strip())
-                    logger.info(f"Retrieval compare metrics: {st.session_state.latest_retrieval_metrics}")
-                else:
-                    st.session_state.latest_retrieval_metrics = None
+        # Validate độ dài câu hỏi
+        MAX_QUERY_LEN = 500
+        if len(query.strip()) > MAX_QUERY_LEN:
+            st.error(f"Câu hỏi quá dài (>{MAX_QUERY_LEN} ký tự). Vui lòng rút ngắn câu hỏi.")
+        else:
+            logger.info(f"Query: {query}")
+            with st.spinner("Processing your query..."):
+                try:
+                    if st.session_state.compare_search:
+                        st.session_state.latest_retrieval_metrics = compare_vector_vs_hybrid(query.strip())
+                        logger.info(f"Retrieval compare metrics: {st.session_state.latest_retrieval_metrics}")
+                    else:
+                        st.session_state.latest_retrieval_metrics = None
 
-                # Conversational chain tự dùng memory + retrieval để xử lý câu hỏi follow-up.
-                answer, source_pages, source_items = ask_question(
-                    query.strip(),
-                    chain=st.session_state.conversation_chain,
-                    llm=st.session_state.llm,
-                    return_sources=True,
-                    return_source_items=True,
-                )
-                st.session_state.latest_answer = answer
-                st.session_state.latest_question = query.strip()
-                # Loại trùng + sắp xếp tăng dần để danh sách nguồn ổn định, dễ kiểm tra.
-                st.session_state.latest_sources = sorted({int(page) for page in source_pages if int(page) >= 1})
-                st.session_state.latest_source_items = source_items
-                st.session_state.selected_source_page = None
-                st.session_state.chat_history.append(
-                    {
-                        "question": query.strip(),
-                        "answer": answer,
-                        "sources": st.session_state.latest_sources,
-                        "source_items": source_items,
-                    }
-                )
-            except Exception as e:
-                st.error("Không có response từ Model!")
-                st.info("Kiểm tra Ollama đang chạy, sau đó thử lại.")
-                st.code(str(e))
+                    # Conversational chain tự dùng memory + retrieval để xử lý câu hỏi follow-up.
+                    result = ask_question(
+                        query.strip(),
+                        chain=st.session_state.conversation_chain,
+                        llm=st.session_state.llm,
+                        return_sources=True,
+                        return_source_items=True,
+                    )
+                    # Hỗ trợ backward compatibility (nếu trả về 3 giá trị cũ)
+                    if len(result) == 6:
+                        answer, source_pages, source_items, self_eval_score, rewritten_query, multihop_steps = result
+                    else:
+                        answer, source_pages, source_items = result
+                        self_eval_score = None
+                        rewritten_query = query.strip()
+                        multihop_steps = None
+                    st.session_state.latest_answer = answer
+                    st.session_state.latest_question = query.strip()
+                    st.session_state.latest_sources = sorted({int(page) for page in source_pages if int(page) >= 1})
+                    st.session_state.latest_source_items = source_items
+                    st.session_state.selected_source_page = None
+                    st.session_state.chat_history.append(
+                        {
+                            "question": query.strip(),
+                            "answer": answer,
+                            "sources": st.session_state.latest_sources,
+                            "source_items": source_items,
+                            "self_eval_score": self_eval_score,
+                            "rewritten_query": rewritten_query,
+                            "multihop_steps": multihop_steps,
+                        }
+                    )
+                except Exception as e:
+                    st.error("Không có response từ Model!")
+                    st.info("Kiểm tra Ollama đang chạy, sau đó thử lại.")
+                    st.code(str(e))
 
     if st.session_state.latest_retrieval_metrics:
         st.markdown("**Retrieval Performance (Vector vs Hybrid):**")
@@ -584,6 +715,51 @@ if st.session_state.retriever is not None:
     if st.session_state.latest_answer:
         st.subheader("Response:")
         st.write(st.session_state.latest_answer)
+        # Hiển thị Self-eval nếu có
+        if st.session_state.chat_history and st.session_state.chat_history[-1].get("self_eval_score"):
+            st.info(f"**Self-Eval:** {st.session_state.chat_history[-1]['self_eval_score']}")
+        # Hiển thị câu hỏi đã rewrite nếu có
+        if st.session_state.chat_history and st.session_state.chat_history[-1].get("rewritten_query") and st.session_state.chat_history[-1]["rewritten_query"] != st.session_state.chat_history[-1]["question"]:
+            st.caption(f"Câu hỏi đã rewrite: {st.session_state.chat_history[-1]['rewritten_query']}")
+        # Hiển thị các bước multi-hop nếu có
+        if st.session_state.chat_history and st.session_state.chat_history[-1].get("multihop_steps"):
+            with st.expander("Multi-hop reasoning steps", expanded=False):
+                for idx, step in enumerate(st.session_state.chat_history[-1]["multihop_steps"], 1):
+                    st.markdown(f"**Bước {idx}:** {step['question']}")
+                    st.markdown(f"Trả lời: {step['answer']}")
+
+        if st.session_state.latest_source_items:
+            with st.expander("Chi tiết điểm số Re-ranking (Cross-Encoder)", expanded=False):
+                st.info("💡 Cross-Encoder đánh giá lại độ liên quan. Điểm càng cao, đoạn văn càng sát với câu hỏi của bạn.")
+                
+                items = st.session_state.latest_source_items
+                
+                # 1. Tạo DataFrame với đầy đủ metadata và làm tròn số
+                df_scores = pd.DataFrame([
+                    {
+                        "Nguồn": f"Trang {item['page']} - {item.get('source', '')[:15]}...",
+                        "Score": round(item.get('rerank_score', 0), 4), # Làm tròn 4 chữ số
+                        "Loại": item.get('file_type', 'N/A'),
+                        "Ngày tải": item.get('upload_at', 'N/A'),
+                        "Nội dung": item['content'][:150] + "..."
+                    } for item in items
+                ])
+
+                # 2. Sắp xếp theo Score giảm dần
+                df_scores = df_scores.sort_values(by="Score", ascending=False)
+                
+                # 3. Hiển thị bảng với style
+                st.dataframe(
+                    df_scores.style.highlight_max(axis=0, subset=['Score'], color='#2e7d32'),
+                    use_container_width=True,
+                    hide_index=True
+                )
+                
+                # 4. Biểu đồ cột so sánh
+                if not df_scores.empty:
+                    # Dùng cột Score làm trục Y
+                    st.bar_chart(df_scores, x="Nguồn", y="Score", color="#2e7d32")
+                    st.caption("Biểu đồ thể hiện mức độ tự tin (Confidence Score) của mô hình Re-ranker.")
 
         # Ưu tiên trang được nhắc trực tiếp trong answer. Nếu model chưa gắn citation, fallback theo trang retrieve.
         cited_pages = parse_cited_pages(st.session_state.latest_answer)
@@ -594,10 +770,17 @@ if st.session_state.retriever is not None:
         if pages_for_buttons:
             st.markdown("**Nguồn tham chiếu:**")
             for page in pages_for_buttons:
-                source_name = grouped_sources.get(page, {}).get("source", "document")
+                info = grouped_sources.get(page, {})
+                source_name = info.get("source", "document")
+                u_at = info.get("upload_at", "N/A")
+                f_type = info.get("file_type", "Unknown")
                 chip_label = f"📄 {source_name} • Page {page}"
-                if st.button(chip_label, key=f"show_source_page_{page}"):
+                col1, col2 = st.columns([0.4, 0.6])
+                with col1:
+                    if st.button(chip_label, key=f"show_source_page_{page}", use_container_width=True):
                         st.session_state.selected_source_page = page
+                with col2:
+                    st.caption(f"📅 Upload: {u_at} | 📁 Loại: {f_type}")
 
         selected_page = st.session_state.selected_source_page
         if selected_page and st.session_state.latest_source_items:

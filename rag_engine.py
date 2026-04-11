@@ -6,6 +6,8 @@ from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_community.vectorstores import FAISS
 from langchain_community.retrievers import BM25Retriever
 from langchain_community.llms import Ollama
+from sentence_transformers import CrossEncoder
+import numpy as np
 import config
 import logging
 import re
@@ -207,6 +209,8 @@ def build_source_items(docs, max_chars_per_item: int = 1200):
                 "source": source,
                 "page": page,
                 "content": content,
+                "upload_at": metadata.get("upload_at", "N/A"), # <--- THÊM DÒNG NÀY
+                "file_type": metadata.get("file_type", "N/A"), # <--- THÊM DÒNG NÀY
             }
         )
 
@@ -287,16 +291,21 @@ def _bm25_tokenize(text: str):
     return re.findall(r"[A-Za-zÀ-ỹ0-9]{2,}", (text or "").lower())
 
 
-def get_vector_retriever(vector_db, k: int | None = None):
+def get_vector_retriever(vector_db, k: int | None = None, filter_metadata: dict | None = None):
     """Retriever semantic search dựa trên embedding + FAISS."""
     top_k = int(k or config.RETRIEVER_K)
+    """Cập nhật: Thêm tham số filter_metadata."""
+    search_kwargs = {
+        "k": top_k,
+        "fetch_k": int(getattr(config, "FETCH_K", max(top_k * 3, top_k))),
+        "lambda_mult": float(getattr(config, "LAMBDA_MULT", 0.7)),
+    }
+    # Nếu có filter, thêm vào search_kwargs
+    if filter_metadata:
+        search_kwargs["filter"] = filter_metadata
     return vector_db.as_retriever(
         search_type=getattr(config, "SEARCH_TYPE", "similarity"),
-        search_kwargs={
-            "k": top_k,
-            "fetch_k": int(getattr(config, "FETCH_K", max(top_k * 3, top_k))),
-            "lambda_mult": float(getattr(config, "LAMBDA_MULT", 0.7)),
-        },
+        search_kwargs=search_kwargs,
     )
 
 
@@ -336,28 +345,31 @@ def build_retrievers(
     bm25_k: int | None = None,
     weights=None,
     use_hybrid: bool = True,
+    filter_metadata: dict | None = None
 ):
     """Trả về bộ retriever đầy đủ để app có thể chuyển mode linh hoạt."""
-    if use_hybrid:
-        hybrid, vector, bm25 = get_hybrid_retriever(
-            vector_db,
-            chunks,
-            vector_k=vector_k,
-            bm25_k=bm25_k,
-            weights=weights,
-        )
-        return {
-            "vector": vector,
-            "bm25": bm25,
-            "hybrid": hybrid,
-        }
+    """Cập nhật: Truyền filter xuống các sub-retrievers."""
+    
+    vector = get_vector_retriever(vector_db, k=vector_k, filter_metadata=filter_metadata)
+    # BM25 lọc thủ công (Simple approach)
+    relevant_chunks = chunks
+    if filter_metadata and "source" in filter_metadata:
+        filter_val = filter_metadata["source"]
+        if isinstance(filter_val, list):
+            relevant_chunks = [c for c in chunks if c.metadata.get("source") in filter_val]
+        else:
+            relevant_chunks = [c for c in chunks if c.metadata.get("source") == filter_val]
 
-    vector = get_vector_retriever(vector_db, k=vector_k)
-    return {
-        "vector": vector,
-        "bm25": None,
-        "hybrid": None,
-    }
+    if use_hybrid:
+        bm25 = get_bm25_retriever(relevant_chunks, k=bm25_k)
+        normalized_weights = _normalize_weights(weights or list(getattr(config, "HYBRID_WEIGHTS", (0.5, 0.5))))
+        
+        hybrid = EnsembleRetriever(
+            retrievers=[vector, bm25],
+            weights=normalized_weights,
+        )
+        return {"vector": vector, "bm25": bm25, "hybrid": hybrid}
+    return {"vector": vector, "bm25": None, "hybrid": None}
 
 #Khởi tạo cầu nối giao tiếp với phần mềm Ollama (nơi đang chạy mô hình Qwen2.5:7b).
 def get_llm():
@@ -369,7 +381,7 @@ def get_llm():
 
 def get_vector_store(
     chunks,
-    file_bytes: bytes,
+    identifier: str,
     chunk_size: int | None = None,
     chunk_overlap: int | None = None,
     use_cache: bool = True,
@@ -379,7 +391,10 @@ def get_vector_store(
     Cache key bao gồm cả chunk strategy để tránh tái sử dụng sai dữ liệu.
     """
     strategy_key = f"{chunk_size or config.CHUNK_SIZE}:{chunk_overlap or config.CHUNK_OVERLAP}"
-    doc_hash = hashlib.sha256(file_bytes + strategy_key.encode("utf-8")).hexdigest()
+    # Tạo hash dựa trên danh sách file + nội dung file + cấu hình chunk
+    combined_info = (identifier + strategy_key).encode("utf-8")
+    doc_hash = hashlib.sha256(combined_info).hexdigest()
+    
     persist_dir = config.FAISS_DIR / doc_hash
     embedder = get_embedding()
 
@@ -433,6 +448,42 @@ def detect_language(text: str) -> str:
         vietnamese_chars = 'áàảãạăắằẳẵặâấầẩẫậéèẻẽẹêếềểễệíìỉĩịóòỏõọôốồổỗộơớờởỡợúùủũụưứừửữựýỳỷỹỵđ'
         return "vi" if any(char in text.lower() for char in vietnamese_chars) else "en"
 
+class ReRanker:
+    def __init__(self, model_name=config.RERANK_MODEL):
+        # Load model vào CPU (hoặc GPU nếu có)
+        self.model = CrossEncoder(model_name, max_length=512)
+
+    # Thêm hàm này để fix lỗi 'no attribute predict'
+    def predict(self, pairs):
+        return self.model.predict(pairs)
+    
+    def rerank(self, query: str, documents: list):
+        if not documents:
+            return []
+        
+        # Chuẩn bị cặp (Query, Passages)
+        pairs = [[query, doc.page_content] for doc in documents]
+        
+        # Dự đoán điểm số (Scores càng cao càng liên quan)
+        scores = self.model.predict(pairs)
+        
+        # Gắn score vào metadata để theo dõi
+        for i, doc in enumerate(documents):
+            doc.metadata["rerank_score"] = float(scores[i])
+        
+        # Sắp xếp lại theo score giảm dần
+        reranked_docs = [doc for _, doc in sorted(zip(scores, documents), key=lambda x: x[0], reverse=True)]
+        
+        return reranked_docs
+
+_reranker_instance = None
+
+def get_reranker():
+    global _reranker_instance
+    if _reranker_instance is None:
+        _reranker_instance = ReRanker()
+    return _reranker_instance
+
 def ask_question(
     query: str,
     retriever=None,
@@ -440,74 +491,135 @@ def ask_question(
     chain=None,
     return_sources: bool = False,
     return_source_items: bool = False,
+    enable_self_eval: bool = True,
+    enable_query_rewrite: bool = True,
+    enable_multihop: bool = True,
 ):
-    """Tạo prompt có citation; có thể trả thêm danh sách source pages.
-
-    Giữ tương thích ngược: mặc định vẫn trả về chuỗi answer như phiên bản cũ.
+    """
+    Advanced RAG: Self-eval, Query Rewriting, Multi-hop Reasoning, Confidence scoring.
     """
     lang = detect_language(query)
+    source_documents = []
+    answer = ""
+    self_eval_score = None
+    rewritten_query = query
+    multihop_steps = []
 
-    # Nhánh mới: Conversational RAG có memory + retrieval tự động.
+    # --- QUERY REWRITING---
+    if enable_query_rewrite and _is_ambiguous_followup(query):
+        try:
+            # Use LLM to rewrite ambiguous query to standalone
+            rewrite_prompt = f"Viết lại câu hỏi sau thành câu hỏi độc lập, rõ ràng, không phụ thuộc ngữ cảnh trước đó.\nCâu hỏi: {query}\nCâu hỏi độc lập:"
+            rewritten_query = llm.invoke(rewrite_prompt).strip()
+        except Exception:
+            rewritten_query = query
+
+    # --- MULTI-HOP REASONING---
+    # For demo: If question contains 'and', split and answer sub-questions, then synthesize
+    if enable_multihop and ' and ' in rewritten_query.lower():
+        sub_questions = [q.strip() for q in re.split(r'\band\b', rewritten_query, flags=re.IGNORECASE) if q.strip()]
+        sub_answers = []
+        for sq in sub_questions:
+            sub_ans, sub_src, sub_items = ask_question(
+                sq, retriever, llm, chain, True, True, enable_self_eval=False, enable_query_rewrite=False, enable_multihop=False
+            )
+            sub_answers.append(sub_ans)
+            multihop_steps.append({'question': sq, 'answer': sub_ans, 'sources': sub_src, 'source_items': sub_items})
+        # Tổng hợp câu trả lời cuối cùng
+        answer = "\n".join([f"- {a}" for a in sub_answers])
+        # Hợp nhất các nguồn
+        source_documents = []
+        final_source_items = []
+        source_pages = []
+        for step in multihop_steps:
+            if step['source_items']:
+                final_source_items.extend(step['source_items'])
+            if step['sources']:
+                source_pages.extend(step['sources'])
+        # Loại bỏ trùng
+        source_pages = sorted({int(p) for p in source_pages if int(p) >= 1})
+        # Tự đánh giá câu trả lời tổng hợp
+        if enable_self_eval:
+            try:
+                eval_prompt = f"Đánh giá mức độ đúng/sát của câu trả lời sau với câu hỏi: '{query}'.\nCâu trả lời: {answer}\nChấm điểm từ 1 (kém) đến 5 (rất tốt), chỉ trả về số điểm và một câu nhận xét ngắn."
+                self_eval_score = llm.invoke(eval_prompt)
+            except Exception:
+                self_eval_score = None
+        if return_sources and return_source_items:
+            return answer, source_pages, final_source_items, self_eval_score, rewritten_query, multihop_steps
+        if return_sources:
+            return answer, source_pages, self_eval_score, rewritten_query, multihop_steps
+        return answer
+
+    # --- RETRIEVAL + RE-RANKING
     if chain is not None:
-        # Nếu không có lịch sử mà user hỏi kiểu follow-up mơ hồ, yêu cầu làm rõ thay vì đoán.
         chat_messages = []
         if getattr(chain, "memory", None) is not None and getattr(chain.memory, "chat_memory", None) is not None:
             chat_messages = getattr(chain.memory.chat_memory, "messages", []) or []
-
         if not chat_messages and _is_ambiguous_followup(query):
             answer = "Mình chưa có ngữ cảnh trước đó trong phiên chat này. Bạn vui lòng nêu rõ chủ thể/câu hỏi đầy đủ để mình trả lời chính xác."
-            source_pages = []
-            source_items = []
-            if return_sources and return_source_items:
-                return answer, source_pages, source_items
-            if return_sources:
-                return answer, source_pages
-            return answer
-
-        result = chain.invoke({"question": query})
+            return (answer, [], [], None, rewritten_query, multihop_steps) if (return_sources and return_source_items) else answer
+        result = chain.invoke({"question": rewritten_query})
         answer = result.get("answer", "")
-        docs = result.get("source_documents", []) or []
-        logger.info(f"Retrieved {len(docs)} documents via conversational chain")
-        source_pages = extract_source_pages(docs)
-        source_items = build_source_items(docs)
+        source_documents = result.get("source_documents", []) or []
     else:
-        # Nhánh cũ giữ tương thích ngược cho các luồng chưa dùng conversational chain.
         if retriever is None or llm is None:
             raise ValueError("Cần truyền chain hoặc cặp retriever + llm")
+        if hasattr(retriever, "search_kwargs"):
+            retriever.search_kwargs["k"] = config.TOP_K_RERANK
+        source_documents = retriever.invoke(rewritten_query)
+        if not source_documents:
+            return "Xin lỗi, mình không tìm thấy thông tin nào liên quan đến câu hỏi này trong tài liệu bạn đã cung cấp."
 
-        docs = retriever.invoke(query)
-        logger.info(f"Retrieved {len(docs)} documents")
-        context = build_citation_context(docs, max_chars=12000)
-        source_pages = extract_source_pages(docs)
-        source_items = build_source_items(docs)
+    # --- RE-RANKING ---
+    final_source_items = []
+    source_pages = []
+    if config.USE_RERANKER and source_documents:
+        reranker = get_reranker()
+        passages = [doc.page_content for doc in source_documents]
+        sentence_pairs = [[rewritten_query, p] for p in passages]
+        scores = reranker.predict(sentence_pairs)
+        for i, doc in enumerate(source_documents):
+            doc.metadata["rerank_score"] = float(scores[i])
+        source_documents = sorted(source_documents, key=lambda x: x.metadata.get("rerank_score", 0), reverse=True)
+        source_documents = source_documents[:config.FINAL_K]
 
+    # --- ANSWER GENERATION ---
+    if chain is None:
+        context = build_citation_context(source_documents, max_chars=12000)
         if lang == "vi":
-            prompt = f"""Sử dụng ngữ cảnh sau đây để trả lời câu hỏi.
-Nếu bạn không biết, chỉ cần nói là bạn không biết.
-Trả lời ngắn gọn (3-4 câu) BẮT BUỘC bằng tiếng Việt.
-Tuyệt đối không được dùng tiếng Trung, tiếng Nhật hoặc tiếng Hàn trong câu trả lời.
-Khi phù hợp, hãy tham chiếu nguồn bằng dạng "(Page X)" dựa trên context.
-
-Ngữ cảnh: {context}
-Câu hỏi: {query}
-Trả lời:"""
+            prompt = f"""Sử dụng ngữ cảnh sau đây để trả lời câu hỏi.\nNếu bạn không biết, chỉ cần nói là bạn không biết.\nTrả lời ngắn gọn (3-4 câu) BẮT BUỘC bằng tiếng Việt.\nTuyệt đối không được dùng tiếng Trung, tiếng Nhật hoặc tiếng Hàn trong câu trả lời.\nKhi phù hợp, hãy tham chiếu nguồn bằng dạng \"(Page X)\" dựa trên context.\n\nNgữ cảnh: {context}\nCâu hỏi: {rewritten_query}\nTrả lời:"""
         else:
-            prompt = f"""Use the following context to answer the question.
-If you don't know the answer, just say you don't know. Keep answer concise (3-4 sentences).
-When relevant, cite sources using "(Page X)" based on the provided context.
-
-Context: {context}
-Question: {query}
-Answer:"""
-
+            prompt = f"""Use the following context to answer the question.\nIf you don't know the answer, just say you don't know. Keep answer concise (3-4 sentences).\nWhen relevant, cite sources using \"(Page X)\" based on the provided context.\n\nContext: {context}\nQuestion: {rewritten_query}\nAnswer:"""
         answer = llm.invoke(prompt)
 
-    # Đảm bảo kết quả cuối không bị lẫn ký tự CJK sai ngôn ngữ mục tiêu.
+    # --- SELF-EVALUATION---
+    if enable_self_eval:
+        try:
+            eval_prompt = f"Đánh giá mức độ đúng/sát của câu trả lời sau với câu hỏi: '{query}'.\nCâu trả lời: {answer}\nChấm điểm từ 1 (kém) đến 5 (rất tốt), chỉ trả về số điểm và một câu nhận xét ngắn."
+            self_eval_score = llm.invoke(eval_prompt)
+        except Exception:
+            self_eval_score = None
+
+    # --- PACKAGE RESULTS ---
+    for doc in source_documents:
+        m = doc.metadata
+        source_pages.append(m.get("page", 1))
+        final_source_items.append({
+            "content": doc.page_content,
+            "source": m.get("source", ""),
+            "page": m.get("page", "N/A"),
+            "chunk": m.get("chunk", "N/A"),
+            "upload_at": m.get("upload_at", "N/A"),
+            "file_type": m.get("file_type", "N/A"),
+            "rerank_score": m.get("rerank_score", 0)
+        })
+
     answer = enforce_answer_language(answer, lang, llm)
     answer = _normalize_answer_tone(answer)
 
     if return_sources and return_source_items:
-        return answer, source_pages, source_items
+        return answer, source_pages, final_source_items, self_eval_score, rewritten_query, multihop_steps
     if return_sources:
-        return answer, source_pages
+        return answer, source_pages, self_eval_score, rewritten_query, multihop_steps
     return answer

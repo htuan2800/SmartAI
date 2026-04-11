@@ -4,6 +4,7 @@ from langchain_community.document_loaders import PDFPlumberLoader, PyPDFLoader
 from langchain_core.documents import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 import config
+from datetime import datetime
 
 
 def _to_int(value, default: int):
@@ -35,7 +36,7 @@ def _load_pdf(file_path: str):
 
     # Nhiều loader trả page bắt đầu từ 0, ta chuyển về 1-based để hiển thị cho người dùng.
     zero_based = bool(raw_pages) and min(raw_pages) == 0
-
+    upload_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S") # Lấy giờ hiện tại
     normalized_docs = []
     for index, doc in enumerate(docs, start=1):
         metadata = dict(doc.metadata or {})
@@ -46,6 +47,8 @@ def _load_pdf(file_path: str):
 
         metadata["page"] = max(1, page_number)
         metadata["source"] = source_name
+        metadata["upload_at"] = upload_time
+        metadata["file_type"] = "PDF"
         normalized_docs.append(Document(page_content=doc.page_content, metadata=metadata))
 
     return normalized_docs
@@ -77,12 +80,20 @@ def _load_docx(file_path: str):
     full_text = "\n".join(sections).strip()
     if not full_text:
         raise ValueError("Không đọc được nội dung DOCX hoặc file rỗng.")
+    
+    upload_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     # DOCX không có khái niệm trang ổn định trong parser này, quy ước page=1 để tracking nguồn.
     return [
         Document(
             page_content=full_text,
-            metadata={"source": Path(file_path).name, "type": "docx", "page": 1},
+            metadata={
+                "source": Path(file_path).name, 
+                "type": "docx", 
+                "page": 1,
+                "upload_at": upload_time, # <--- THÊM DÒNG NÀY
+                "file_type": "DOCX"        # <--- THÊM DÒNG NÀY
+            },
         )
     ]
 
@@ -119,3 +130,16 @@ def load_and_split_document(file_path: str, chunk_size: int | None = None, chunk
 def load_and_split_pdf(file_path: str):
     """Giữ tương thích ngược với code cũ."""
     return load_and_split_document(file_path)
+
+
+
+def load_multiple_documents(file_paths: list[str], chunk_size: int = None, chunk_overlap: int = None):
+    """Xử lý danh sách nhiều file và gộp tất cả các chunks lại."""
+    all_chunks = []
+    for path in file_paths:
+        try:
+            chunks = load_and_split_document(path, chunk_size, chunk_overlap)
+            all_chunks.extend(chunks)
+        except Exception as e:
+            print(f"Lỗi khi xử lý file {path}: {e}")
+    return all_chunks
