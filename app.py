@@ -91,6 +91,7 @@ def init_session_state():
         "llm": None,
         "current_file_path": None,
         "current_file_bytes": None,
+        "current_files_identifier": None,
         "current_chunks": [],
         "chat_history": [],
         "latest_answer": "",
@@ -107,6 +108,7 @@ def init_session_state():
         "hybrid_weight_bm25": float(config.HYBRID_WEIGHTS[1]),
         "retriever_signature": None,
         "latest_retrieval_metrics": None,
+        "latest_rerank_metrics": None,
         "compare_search": bool(config.SHOW_RETRIEVAL_COMPARISON),
         "benchmark_input": "",
     }
@@ -156,9 +158,11 @@ def clear_vector_store_state():
     st.session_state.llm = None
     st.session_state.current_file_path = None
     st.session_state.current_file_bytes = None
+    st.session_state.current_files_identifier = None
     st.session_state.current_chunks = []
     st.session_state.retriever_signature = None
     st.session_state.latest_retrieval_metrics = None
+    st.session_state.latest_rerank_metrics = None
 
 
 def parse_benchmark_cases(raw_text: str):
@@ -540,7 +544,7 @@ if uploaded_files and len(uploaded_files) > 0:
                     file_bytes = uploaded_file.getvalue()
                     raw_hash = hashlib.sha256(file_bytes).hexdigest()
                     clean_name = re.sub(r'[\\/*?:"<>|]', "_", uploaded_file.name)
-                    file_path = config.UPLOAD_DIR / f"{raw_hash}_{uploaded_file.name}"
+                    file_path = config.UPLOAD_DIR / f"{raw_hash}_{clean_name}"
                     if not file_path.exists():
                         file_path.write_bytes(file_bytes)
                     current_file_paths.append(str(file_path))
@@ -579,6 +583,7 @@ if uploaded_files and len(uploaded_files) > 0:
             st.session_state.current_chunks = all_chunks
             st.session_state.current_files_identifier = files_identifier
             st.session_state.latest_retrieval_metrics = None
+            st.session_state.latest_rerank_metrics = None
 
             st.success(f"Đã upload thành công {len(all_chunks)} chunk từ {len(uploaded_files)} file.")
 
@@ -652,6 +657,7 @@ if st.session_state.retriever is not None:
                         logger.info(f"Retrieval compare metrics: {st.session_state.latest_retrieval_metrics}")
                     else:
                         st.session_state.latest_retrieval_metrics = None
+                        st.session_state.latest_rerank_metrics = None
 
                     # Conversational chain tự dùng memory + retrieval để xử lý câu hỏi follow-up.
                     result = ask_question(
@@ -662,18 +668,23 @@ if st.session_state.retriever is not None:
                         return_source_items=True,
                     )
                     # Hỗ trợ backward compatibility (nếu trả về 3 giá trị cũ)
-                    if len(result) == 6:
+                    if len(result) == 7:
+                        answer, source_pages, source_items, self_eval_score, rewritten_query, multihop_steps, rerank_metrics = result
+                    elif len(result) == 6:
                         answer, source_pages, source_items, self_eval_score, rewritten_query, multihop_steps = result
+                        rerank_metrics = None
                     else:
                         answer, source_pages, source_items = result
                         self_eval_score = None
                         rewritten_query = query.strip()
                         multihop_steps = None
+                        rerank_metrics = None
                     st.session_state.latest_answer = answer
                     st.session_state.latest_question = query.strip()
                     st.session_state.latest_sources = sorted({int(page) for page in source_pages if int(page) >= 1})
                     st.session_state.latest_source_items = source_items
                     st.session_state.selected_source_page = None
+                    st.session_state.latest_rerank_metrics = rerank_metrics
                     st.session_state.chat_history.append(
                         {
                             "question": query.strip(),
@@ -683,6 +694,7 @@ if st.session_state.retriever is not None:
                             "self_eval_score": self_eval_score,
                             "rewritten_query": rewritten_query,
                             "multihop_steps": multihop_steps,
+                            "rerank_metrics": rerank_metrics,
                         }
                     )
                 except Exception as e:
@@ -761,6 +773,26 @@ if st.session_state.retriever is not None:
                     st.bar_chart(df_scores, x="Nguồn", y="Score", color="#2e7d32")
                     st.caption("Biểu đồ thể hiện mức độ tự tin (Confidence Score) của mô hình Re-ranker.")
 
+        if st.session_state.latest_rerank_metrics:
+            with st.expander("So sánh Re-ranking vs Bi-encoder", expanded=False):
+                metrics = st.session_state.latest_rerank_metrics
+                summary_df = pd.DataFrame(
+                    [
+                        {
+                            "retrieval_time_ms": metrics.get("retrieval_time_ms", 0),
+                            "rerank_time_ms": metrics.get("rerank_time_ms", 0),
+                            "total_pipeline_ms": metrics.get("total_pipeline_ms", 0),
+                            "docs_before_rerank": metrics.get("docs_before_rerank", 0),
+                            "docs_after_rerank": metrics.get("docs_after_rerank", 0),
+                        }
+                    ]
+                )
+                st.dataframe(summary_df, use_container_width=True, hide_index=True)
+                st.caption(
+                    f"Top pages trước re-rank: {metrics.get('pages_before_rerank', [])} | "
+                    f"sau re-rank: {metrics.get('pages_after_rerank', [])}"
+                )
+
         # Ưu tiên trang được nhắc trực tiếp trong answer. Nếu model chưa gắn citation, fallback theo trang retrieve.
         cited_pages = parse_cited_pages(st.session_state.latest_answer)
         pages_for_buttons = cited_pages or st.session_state.latest_sources
@@ -834,7 +866,7 @@ if st.session_state.retriever is not None:
                     )
                     vector_db = get_vector_store(
                         chunks,
-                        st.session_state.current_file_bytes,
+                        f"benchmark::{st.session_state.current_file_path}",
                         chunk_size=chunk_size,
                         chunk_overlap=chunk_overlap,
                     )

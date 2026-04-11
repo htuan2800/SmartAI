@@ -1,5 +1,6 @@
 import hashlib
 import importlib
+import time
 from pathlib import Path
 from langchain_core.prompts import PromptTemplate
 from langchain_community.embeddings import HuggingFaceEmbeddings
@@ -504,6 +505,15 @@ def ask_question(
     self_eval_score = None
     rewritten_query = query
     multihop_steps = []
+    rerank_metrics = {
+        "retrieval_time_ms": 0.0,
+        "rerank_time_ms": 0.0,
+        "total_pipeline_ms": 0.0,
+        "docs_before_rerank": 0,
+        "docs_after_rerank": 0,
+        "pages_before_rerank": [],
+        "pages_after_rerank": [],
+    }
 
     # --- QUERY REWRITING---
     if enable_query_rewrite and _is_ambiguous_followup(query):
@@ -516,13 +526,21 @@ def ask_question(
 
     # --- MULTI-HOP REASONING---
     # For demo: If question contains 'and', split and answer sub-questions, then synthesize
-    if enable_multihop and ' and ' in rewritten_query.lower():
-        sub_questions = [q.strip() for q in re.split(r'\band\b', rewritten_query, flags=re.IGNORECASE) if q.strip()]
+    if enable_multihop and re.search(r"\b(and|và)\b", rewritten_query, flags=re.IGNORECASE):
+        sub_questions = [
+            q.strip(" ,.;:\t\n")
+            for q in re.split(r"\b(?:and|và)\b", rewritten_query, flags=re.IGNORECASE)
+            if q.strip()
+        ]
         sub_answers = []
         for sq in sub_questions:
-            sub_ans, sub_src, sub_items = ask_question(
+            sub_result = ask_question(
                 sq, retriever, llm, chain, True, True, enable_self_eval=False, enable_query_rewrite=False, enable_multihop=False
             )
+            if isinstance(sub_result, tuple) and len(sub_result) >= 3:
+                sub_ans, sub_src, sub_items = sub_result[:3]
+            else:
+                sub_ans, sub_src, sub_items = str(sub_result), [], []
             sub_answers.append(sub_ans)
             multihop_steps.append({'question': sq, 'answer': sub_ans, 'sources': sub_src, 'source_items': sub_items})
         # Tổng hợp câu trả lời cuối cùng
@@ -546,35 +564,47 @@ def ask_question(
             except Exception:
                 self_eval_score = None
         if return_sources and return_source_items:
-            return answer, source_pages, final_source_items, self_eval_score, rewritten_query, multihop_steps
+            rerank_metrics["docs_before_rerank"] = len(final_source_items)
+            rerank_metrics["docs_after_rerank"] = len(final_source_items)
+            rerank_metrics["pages_before_rerank"] = source_pages
+            rerank_metrics["pages_after_rerank"] = source_pages
+            return answer, source_pages, final_source_items, self_eval_score, rewritten_query, multihop_steps, rerank_metrics
         if return_sources:
             return answer, source_pages, self_eval_score, rewritten_query, multihop_steps
         return answer
 
     # --- RETRIEVAL + RE-RANKING
     if chain is not None:
+        retrieval_started = time.perf_counter()
         chat_messages = []
         if getattr(chain, "memory", None) is not None and getattr(chain.memory, "chat_memory", None) is not None:
             chat_messages = getattr(chain.memory.chat_memory, "messages", []) or []
         if not chat_messages and _is_ambiguous_followup(query):
             answer = "Mình chưa có ngữ cảnh trước đó trong phiên chat này. Bạn vui lòng nêu rõ chủ thể/câu hỏi đầy đủ để mình trả lời chính xác."
-            return (answer, [], [], None, rewritten_query, multihop_steps) if (return_sources and return_source_items) else answer
+            return (answer, [], [], None, rewritten_query, multihop_steps, rerank_metrics) if (return_sources and return_source_items) else answer
         result = chain.invoke({"question": rewritten_query})
+        rerank_metrics["retrieval_time_ms"] = round((time.perf_counter() - retrieval_started) * 1000, 2)
         answer = result.get("answer", "")
         source_documents = result.get("source_documents", []) or []
     else:
         if retriever is None or llm is None:
             raise ValueError("Cần truyền chain hoặc cặp retriever + llm")
+        retrieval_started = time.perf_counter()
         if hasattr(retriever, "search_kwargs"):
             retriever.search_kwargs["k"] = config.TOP_K_RERANK
         source_documents = retriever.invoke(rewritten_query)
+        rerank_metrics["retrieval_time_ms"] = round((time.perf_counter() - retrieval_started) * 1000, 2)
         if not source_documents:
             return "Xin lỗi, mình không tìm thấy thông tin nào liên quan đến câu hỏi này trong tài liệu bạn đã cung cấp."
+
+    rerank_metrics["docs_before_rerank"] = len(source_documents)
+    rerank_metrics["pages_before_rerank"] = extract_source_pages(source_documents)
 
     # --- RE-RANKING ---
     final_source_items = []
     source_pages = []
     if config.USE_RERANKER and source_documents:
+        rerank_started = time.perf_counter()
         reranker = get_reranker()
         passages = [doc.page_content for doc in source_documents]
         sentence_pairs = [[rewritten_query, p] for p in passages]
@@ -583,6 +613,10 @@ def ask_question(
             doc.metadata["rerank_score"] = float(scores[i])
         source_documents = sorted(source_documents, key=lambda x: x.metadata.get("rerank_score", 0), reverse=True)
         source_documents = source_documents[:config.FINAL_K]
+        rerank_metrics["rerank_time_ms"] = round((time.perf_counter() - rerank_started) * 1000, 2)
+
+    rerank_metrics["docs_after_rerank"] = len(source_documents)
+    rerank_metrics["pages_after_rerank"] = extract_source_pages(source_documents)
 
     # --- ANSWER GENERATION ---
     if chain is None:
@@ -617,9 +651,13 @@ def ask_question(
 
     answer = enforce_answer_language(answer, lang, llm)
     answer = _normalize_answer_tone(answer)
+    rerank_metrics["total_pipeline_ms"] = round(
+        float(rerank_metrics.get("retrieval_time_ms", 0.0)) + float(rerank_metrics.get("rerank_time_ms", 0.0)),
+        2,
+    )
 
     if return_sources and return_source_items:
-        return answer, source_pages, final_source_items, self_eval_score, rewritten_query, multihop_steps
+        return answer, source_pages, final_source_items, self_eval_score, rewritten_query, multihop_steps, rerank_metrics
     if return_sources:
         return answer, source_pages, self_eval_score, rewritten_query, multihop_steps
     return answer
