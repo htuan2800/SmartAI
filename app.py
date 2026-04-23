@@ -466,18 +466,23 @@ with st.sidebar:
     st.header("Chat History")
     if st.session_state.chat_history:
         for idx, item in enumerate(reversed(st.session_state.chat_history), start=1):
+            # Expander Cha (Bao bọc toàn bộ 1 phiên hỏi đáp)
             with st.expander(f"Q{len(st.session_state.chat_history) - idx + 1}: {item['question'][:70]}"):
                 st.markdown(f"**Q:** {item['question']}")
                 st.markdown(f"**A:** {item['answer']}")
+                
                 if item.get("source_items"):
-                    with st.expander("Nguồn tham chiếu (đã highlight)", expanded=False):
+                    st.markdown("---")
+                    st.markdown("🔍 **Nguồn tham chiếu (đã highlight):**")
+                    
+                    with st.container():
                         terms = extract_query_terms(item.get("question", ""))
                         for source_item in item["source_items"]:
                             st.markdown(
-                                f"**{source_item['source']} - Page {source_item['page']}**"
+                                f"*{source_item['source']} - Page {source_item['page']}*"
                             )
                             rendered = highlight_text(source_item.get("content", ""), terms)
-                            st.markdown(rendered, unsafe_allow_html=True)
+                            st.markdown(f"> {rendered}", unsafe_allow_html=True)
     else:
         st.caption("Chưa có lịch sử hội thoại.")
 
@@ -697,6 +702,8 @@ if st.session_state.retriever is not None:
                             "rerank_metrics": rerank_metrics,
                         }
                     )
+                    
+                    st.rerun() # load lịch sử chat
                 except Exception as e:
                     st.error("Không có response từ Model!")
                     st.info("Kiểm tra Ollama đang chạy, sau đó thử lại.")
