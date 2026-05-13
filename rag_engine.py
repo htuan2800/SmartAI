@@ -497,10 +497,10 @@ def ask_question(
     enable_multihop: bool = True,
 ):
     """
-    Advanced RAG: Self-eval, Query Rewriting, Multi-hop Reasoning, Confidence scoring.
+    Advanced RAG: Manual Pipeline (Retrieval -> Re-ranking -> LLM Generation -> Memory Update).
+    Đã khắc phục lỗi LLM sinh câu trả lời trước khi Re-ranking.
     """
     lang = detect_language(query)
-    source_documents = []
     answer = ""
     self_eval_score = None
     rewritten_query = query
@@ -515,17 +515,38 @@ def ask_question(
         "pages_after_rerank": [],
     }
 
-    # --- QUERY REWRITING---
+    # Định vị Retriever thực sự (Từ tham số hoặc từ chain)
+    active_retriever = retriever if retriever else (chain.retriever if chain else None)
+    if not active_retriever or not llm:
+        raise ValueError("Cần truyền active_retriever hoặc truyền cặp chain + llm")
+
+    # --- BƯỚC 1: TRÍCH XUẤT LỊCH SỬ HỘI THOẠI ---
+    chat_history = []
+    if chain and hasattr(chain, "memory"):
+        mem_vars = chain.memory.load_memory_variables({})
+        chat_history = mem_vars.get("chat_history", [])
+
+    # Xử lý ngoại lệ: Câu hỏi cộc lốc nhưng chưa có lịch sử chat
+    if not chat_history and _is_ambiguous_followup(query):
+        answer = "Mình chưa có ngữ cảnh trước đó trong phiên chat này. Bạn vui lòng nêu rõ chủ thể/câu hỏi đầy đủ để mình trả lời chính xác."
+        if return_sources and return_source_items:
+            return answer, [], [], None, rewritten_query, multihop_steps, rerank_metrics
+        if return_sources:
+            return answer, [], None, rewritten_query, multihop_steps
+        return answer
+
+    # --- BƯỚC 2: QUERY REWRITING (Nếu cần) ---
     if enable_query_rewrite and _is_ambiguous_followup(query):
         try:
-            # Use LLM to rewrite ambiguous query to standalone
-            rewrite_prompt = f"Viết lại câu hỏi sau thành câu hỏi độc lập, rõ ràng, không phụ thuộc ngữ cảnh trước đó.\nCâu hỏi: {query}\nCâu hỏi độc lập:"
-            rewritten_query = llm.invoke(rewrite_prompt).strip()
+            condense_prompt = CONDENSE_QUESTION_PROMPT.format(
+                chat_history=chat_history, 
+                question=query
+            )
+            rewritten_query = llm.invoke(condense_prompt).strip()
         except Exception:
             rewritten_query = query
 
-    # --- MULTI-HOP REASONING---
-    # For demo: If question contains 'and', split and answer sub-questions, then synthesize
+    # --- BƯỚC 3: MULTI-HOP REASONING ---
     if enable_multihop and re.search(r"\b(and|và)\b", rewritten_query, flags=re.IGNORECASE):
         sub_questions = [
             q.strip(" ,.;:\t\n")
@@ -533,101 +554,103 @@ def ask_question(
             if q.strip()
         ]
         sub_answers = []
+        source_pages = []
+        final_source_items = []
+        
         for sq in sub_questions:
+            # Đệ quy gọi lại chính hàm này cho từng câu hỏi phụ
             sub_result = ask_question(
-                sq, retriever, llm, chain, True, True, enable_self_eval=False, enable_query_rewrite=False, enable_multihop=False
+                sq, active_retriever, llm, chain, True, True, 
+                enable_self_eval=False, enable_query_rewrite=False, enable_multihop=False
             )
             if isinstance(sub_result, tuple) and len(sub_result) >= 3:
                 sub_ans, sub_src, sub_items = sub_result[:3]
             else:
                 sub_ans, sub_src, sub_items = str(sub_result), [], []
+                
             sub_answers.append(sub_ans)
             multihop_steps.append({'question': sq, 'answer': sub_ans, 'sources': sub_src, 'source_items': sub_items})
-        # Tổng hợp câu trả lời cuối cùng
+            
+            if sub_items:
+                final_source_items.extend(sub_items)
+            if sub_src:
+                source_pages.extend(sub_src)
+
+        # Tổng hợp đáp án
         answer = "\n".join([f"- {a}" for a in sub_answers])
-        # Hợp nhất các nguồn
-        source_documents = []
-        final_source_items = []
-        source_pages = []
-        for step in multihop_steps:
-            if step['source_items']:
-                final_source_items.extend(step['source_items'])
-            if step['sources']:
-                source_pages.extend(step['sources'])
-        # Loại bỏ trùng
         source_pages = sorted({int(p) for p in source_pages if int(p) >= 1})
-        # Tự đánh giá câu trả lời tổng hợp
+        
         if enable_self_eval:
             try:
                 eval_prompt = f"Đánh giá mức độ đúng/sát của câu trả lời sau với câu hỏi: '{query}'.\nCâu trả lời: {answer}\nChấm điểm từ 1 (kém) đến 5 (rất tốt), chỉ trả về số điểm và một câu nhận xét ngắn."
                 self_eval_score = llm.invoke(eval_prompt)
             except Exception:
                 self_eval_score = None
+
         if return_sources and return_source_items:
             rerank_metrics["docs_before_rerank"] = len(final_source_items)
             rerank_metrics["docs_after_rerank"] = len(final_source_items)
-            rerank_metrics["pages_before_rerank"] = source_pages
-            rerank_metrics["pages_after_rerank"] = source_pages
             return answer, source_pages, final_source_items, self_eval_score, rewritten_query, multihop_steps, rerank_metrics
         if return_sources:
             return answer, source_pages, self_eval_score, rewritten_query, multihop_steps
         return answer
 
-    # --- RETRIEVAL + RE-RANKING
-    if chain is not None:
-        retrieval_started = time.perf_counter()
-        chat_messages = []
-        if getattr(chain, "memory", None) is not None and getattr(chain.memory, "chat_memory", None) is not None:
-            chat_messages = getattr(chain.memory.chat_memory, "messages", []) or []
-        if not chat_messages and _is_ambiguous_followup(query):
-            answer = "Mình chưa có ngữ cảnh trước đó trong phiên chat này. Bạn vui lòng nêu rõ chủ thể/câu hỏi đầy đủ để mình trả lời chính xác."
-            return (answer, [], [], None, rewritten_query, multihop_steps, rerank_metrics) if (return_sources and return_source_items) else answer
-        result = chain.invoke({"question": rewritten_query})
-        rerank_metrics["retrieval_time_ms"] = round((time.perf_counter() - retrieval_started) * 1000, 2)
-        answer = result.get("answer", "")
-        source_documents = result.get("source_documents", []) or []
-    else:
-        if retriever is None or llm is None:
-            raise ValueError("Cần truyền chain hoặc cặp retriever + llm")
-        retrieval_started = time.perf_counter()
-        if hasattr(retriever, "search_kwargs"):
-            retriever.search_kwargs["k"] = config.TOP_K_RERANK
-        source_documents = retriever.invoke(rewritten_query)
-        rerank_metrics["retrieval_time_ms"] = round((time.perf_counter() - retrieval_started) * 1000, 2)
-        if not source_documents:
-            return "Xin lỗi, mình không tìm thấy thông tin nào liên quan đến câu hỏi này trong tài liệu bạn đã cung cấp."
+    # --- BƯỚC 4: RETRIEVAL (VÒNG 1 - TÌM KIẾM RỘNG) ---
+    retrieval_started = time.perf_counter()
+    if hasattr(active_retriever, "search_kwargs"):
+        active_retriever.search_kwargs["k"] = config.TOP_K_RERANK
 
-    rerank_metrics["docs_before_rerank"] = len(source_documents)
-    rerank_metrics["pages_before_rerank"] = extract_source_pages(source_documents)
+    raw_docs = active_retriever.invoke(rewritten_query)
+    rerank_metrics["retrieval_time_ms"] = round((time.perf_counter() - retrieval_started) * 1000, 2)
+    rerank_metrics["docs_before_rerank"] = len(raw_docs)
+    rerank_metrics["pages_before_rerank"] = extract_source_pages(raw_docs)
 
-    # --- RE-RANKING ---
-    final_source_items = []
-    source_pages = []
-    if config.USE_RERANKER and source_documents:
+    if not raw_docs:
+        answer = "Xin lỗi, mình không tìm thấy thông tin nào liên quan đến câu hỏi này trong tài liệu bạn đã cung cấp."
+        if return_sources and return_source_items:
+            return answer, [], [], None, rewritten_query, multihop_steps, rerank_metrics
+        if return_sources:
+            return answer, [], None, rewritten_query, multihop_steps
+        return answer
+
+    # --- BƯỚC 5: RE-RANKING (VÒNG 2 - LỌC TINH BẰNG CROSS-ENCODER) ---
+    final_docs = raw_docs
+    if config.USE_RERANKER and raw_docs:
         rerank_started = time.perf_counter()
         reranker = get_reranker()
-        passages = [doc.page_content for doc in source_documents]
+        passages = [doc.page_content for doc in raw_docs]
         sentence_pairs = [[rewritten_query, p] for p in passages]
         scores = reranker.predict(sentence_pairs)
-        for i, doc in enumerate(source_documents):
+        
+        for i, doc in enumerate(raw_docs):
             doc.metadata["rerank_score"] = float(scores[i])
-        source_documents = sorted(source_documents, key=lambda x: x.metadata.get("rerank_score", 0), reverse=True)
-        source_documents = source_documents[:config.FINAL_K]
+        
+        # Sắp xếp và chỉ lấy Top K cuối cùng (Thường là 3-5 đoạn)
+        final_docs = sorted(raw_docs, key=lambda x: x.metadata.get("rerank_score", 0), reverse=True)[:config.FINAL_K]
         rerank_metrics["rerank_time_ms"] = round((time.perf_counter() - rerank_started) * 1000, 2)
 
-    rerank_metrics["docs_after_rerank"] = len(source_documents)
-    rerank_metrics["pages_after_rerank"] = extract_source_pages(source_documents)
+    rerank_metrics["docs_after_rerank"] = len(final_docs)
+    rerank_metrics["pages_after_rerank"] = extract_source_pages(final_docs)
+    rerank_metrics["total_pipeline_ms"] = round(rerank_metrics["retrieval_time_ms"] + rerank_metrics["rerank_time_ms"], 2)
 
-    # --- ANSWER GENERATION ---
-    if chain is None:
-        context = build_citation_context(source_documents, max_chars=12000)
-        if lang == "vi":
-            prompt = f"""Sử dụng ngữ cảnh sau đây để trả lời câu hỏi.\nNếu bạn không biết, chỉ cần nói là bạn không biết.\nTrả lời ngắn gọn (3-4 câu) BẮT BUỘC bằng tiếng Việt.\nTuyệt đối không được dùng tiếng Trung, tiếng Nhật hoặc tiếng Hàn trong câu trả lời.\nKhi phù hợp, hãy tham chiếu nguồn bằng dạng \"(Page X)\" dựa trên context.\n\nNgữ cảnh: {context}\nCâu hỏi: {rewritten_query}\nTrả lời:"""
-        else:
-            prompt = f"""Use the following context to answer the question.\nIf you don't know the answer, just say you don't know. Keep answer concise (3-4 sentences).\nWhen relevant, cite sources using \"(Page X)\" based on the provided context.\n\nContext: {context}\nQuestion: {rewritten_query}\nAnswer:"""
-        answer = llm.invoke(prompt)
+    # --- BƯỚC 6: ANSWER GENERATION (LLM ĐỌC TÀI LIỆU SẠCH) ---
+    context = build_citation_context(final_docs, max_chars=12000)
+    
+    if lang == "vi":
+        prompt = f"""Sử dụng ngữ cảnh sau đây để trả lời câu hỏi.\nNếu bạn không biết, chỉ cần nói là bạn không biết.\nTrả lời ngắn gọn (3-4 câu) BẮT BUỘC bằng tiếng Việt.\nTuyệt đối không được dùng tiếng Trung, tiếng Nhật hoặc tiếng Hàn trong câu trả lời.\nKhi phù hợp, hãy tham chiếu nguồn bằng dạng "(Page X)" dựa trên context.\n\nNgữ cảnh: {context}\nCâu hỏi: {rewritten_query}\nTrả lời:"""
+    else:
+        prompt = f"""Use the following context to answer the question.\nIf you don't know the answer, just say you don't know. Keep answer concise (3-4 sentences).\nWhen relevant, cite sources using "(Page X)" based on the provided context.\n\nContext: {context}\nQuestion: {rewritten_query}\nAnswer:"""
+    
+    answer = llm.invoke(prompt)
+    answer = enforce_answer_language(answer, lang, llm)
+    answer = _normalize_answer_tone(answer)
 
-    # --- SELF-EVALUATION---
+    # --- BƯỚC 7: CẬP NHẬT BỘ NHỚ LỊCH SỬ ---
+    # Việc này giúp LLM nhớ câu hỏi và câu trả lời này cho các câu hỏi follow-up sau này
+    if chain and hasattr(chain, "memory"):
+        chain.memory.save_context({"question": query}, {"answer": answer})
+
+    # --- BƯỚC 8: SELF-EVALUATION ---
     if enable_self_eval:
         try:
             eval_prompt = f"Đánh giá mức độ đúng/sát của câu trả lời sau với câu hỏi: '{query}'.\nCâu trả lời: {answer}\nChấm điểm từ 1 (kém) đến 5 (rất tốt), chỉ trả về số điểm và một câu nhận xét ngắn."
@@ -635,10 +658,11 @@ def ask_question(
         except Exception:
             self_eval_score = None
 
-    # --- PACKAGE RESULTS ---
-    for doc in source_documents:
+    # --- BƯỚC 9: ĐÓNG GÓI KẾT QUẢ TRẢ VỀ CHO APP.PY ---
+    source_pages = extract_source_pages(final_docs)
+    final_source_items = []
+    for doc in final_docs:
         m = doc.metadata
-        source_pages.append(m.get("page", 1))
         final_source_items.append({
             "content": doc.page_content,
             "source": m.get("source", ""),
@@ -648,13 +672,6 @@ def ask_question(
             "file_type": m.get("file_type", "N/A"),
             "rerank_score": m.get("rerank_score", 0)
         })
-
-    answer = enforce_answer_language(answer, lang, llm)
-    answer = _normalize_answer_tone(answer)
-    rerank_metrics["total_pipeline_ms"] = round(
-        float(rerank_metrics.get("retrieval_time_ms", 0.0)) + float(rerank_metrics.get("rerank_time_ms", 0.0)),
-        2,
-    )
 
     if return_sources and return_source_items:
         return answer, source_pages, final_source_items, self_eval_score, rewritten_query, multihop_steps, rerank_metrics
