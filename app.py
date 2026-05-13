@@ -356,40 +356,43 @@ with st.sidebar:
         index=0 if st.session_state.search_mode == "Hybrid" else 1,
         horizontal=True,
     )
+    
+    if st.session_state.search_mode == "Hybrid":
+        st.session_state.bm25_k = st.number_input(
+            "BM25 Top-k",
+            min_value=1,
+            max_value=20,
+            step=1,
+            value=int(st.session_state.bm25_k),
+        )
 
-    st.session_state.bm25_k = st.number_input(
-        "BM25 Top-k",
-        min_value=1,
-        max_value=20,
-        step=1,
-        value=int(st.session_state.bm25_k),
-    )
+        vector_w = st.slider(
+            "Weight: Vector",
+            min_value=0.0,
+            max_value=1.0,
+            value=float(st.session_state.hybrid_weight_vector),
+            step=0.05,
+        )
+        bm25_w = st.slider(
+            "Weight: BM25",
+            min_value=0.0,
+            max_value=1.0,
+            value=float(st.session_state.hybrid_weight_bm25),
+            step=0.05,
+        )
 
-    vector_w = st.slider(
-        "Weight: Vector",
-        min_value=0.0,
-        max_value=1.0,
-        value=float(st.session_state.hybrid_weight_vector),
-        step=0.05,
-    )
-    bm25_w = st.slider(
-        "Weight: BM25",
-        min_value=0.0,
-        max_value=1.0,
-        value=float(st.session_state.hybrid_weight_bm25),
-        step=0.05,
-    )
+        if vector_w + bm25_w == 0:
+            st.warning("Tổng weights đang bằng 0, hệ thống tự fallback về [0.5, 0.5].")
 
-    if vector_w + bm25_w == 0:
-        st.warning("Tổng weights đang bằng 0, hệ thống tự fallback về [0.5, 0.5].")
-
-    st.session_state.hybrid_weight_vector = float(vector_w)
-    st.session_state.hybrid_weight_bm25 = float(bm25_w)
-    st.session_state.compare_search = st.checkbox(
-        "So sánh Vector vs Hybrid theo từng query",
-        value=bool(st.session_state.compare_search),
-    )
-
+        st.session_state.hybrid_weight_vector = float(vector_w)
+        st.session_state.hybrid_weight_bm25 = float(bm25_w)
+        st.session_state.compare_search = st.checkbox(
+            "So sánh Vector vs Hybrid theo từng query",
+            value=bool(st.session_state.compare_search),
+        )
+    else:
+        #Nếu người dùng chọn Vector, tự động tắt tính năng so sánh
+        st.session_state.compare_search = False
     st.markdown("---")
     st.header("Filter Settings")
     
